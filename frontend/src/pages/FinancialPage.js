@@ -82,7 +82,12 @@ export default function FinancialPage() {
     const relock = () => setUnlocked(false);
     window.addEventListener('finance-locked', relock);
     const t = setInterval(() => { if (!getUnlock()) setUnlocked(false); }, 60000);
-    return () => { window.removeEventListener('finance-locked', relock); clearInterval(t); };
+    return () => {
+      window.removeEventListener('finance-locked', relock);
+      clearInterval(t);
+      // Saiu do Financeiro (não só trocou de aba): exige a senha de novo.
+      setTimeout(() => { if (!window.location.pathname.startsWith('/financial')) clearUnlock(); }, 0);
+    };
   }, []);
 
   if (!me) return <DashboardLayout><div className="py-20 text-center text-slate-500"><Loader2 className="h-5 w-5 animate-spin inline mr-2" />Carregando…</div></DashboardLayout>;
