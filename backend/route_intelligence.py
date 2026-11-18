@@ -35,7 +35,7 @@ class IntelRequest(BaseModel):
     max_stops: int = 9
     service_minutes: int = 45
     day_minutes: int = 540
-    radius_minutes: float = 25
+    radius_minutes: float = 18
     start_time: str = "08:00"
 
 
@@ -139,7 +139,7 @@ def _build_routes(req: IntelRequest, T):
     orders = req.orders
     n = len(orders)
     pts = T[1:, 1:]
-    labels = _dbscan(pts, eps=min(12, req.radius_minutes))
+    labels = _dbscan(pts, eps=min(10, req.radius_minutes))
     region_score = {}
     for i, lb in enumerate(labels):
         o = orders[i]
@@ -160,8 +160,11 @@ def _build_routes(req: IntelRequest, T):
             stops = [s - 1 for s in seq[1:-1]]
             best = None
             for k in unassigned:
-                near = min(pts[k, s] for s in stops)
-                if near > req.radius_minutes:
+                # Compacto em volta da semente: sem "encadear" regiões vizinhas; outra cidade só se colada.
+                to_seed = pts[k, seed]
+                if to_seed > req.radius_minutes:
+                    continue
+                if _norm(orders[k].city) != _norm(orders[seed].city) and to_seed > 8:
                     continue
                 delta, pos = _best_insertion(seq, k + 1, T)
                 same_nb = any(_norm(orders[k].neighborhood) and _norm(orders[k].neighborhood) == _norm(orders[s].neighborhood) for s in stops)
@@ -242,6 +245,8 @@ async def regional_suggestions(req: IntelRequest):
     out = []
     for n, idx in enumerate(routes, 1):
         d = await _describe(req, idx, T, K)
-        d["name"] = f"Roteiro {n} · Região {d['region']}"
+        place = d["cities"][0] if d["cities"] else ""
+        nbs = ", ".join(d["neighborhoods"][:2])
+        d["name"] = f"Roteiro {n} · {place}" + (f" — {nbs}" if nbs else "")
         out.append(d)
     return {"routes": out, "grouped": sum(len(r["stops"]) for r in out), "unassigned": left}

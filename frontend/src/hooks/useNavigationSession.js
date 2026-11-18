@@ -59,7 +59,7 @@ export function useNavigationSession({ base, stops, returnToBase, ensureSaved, c
   const busy = useRef(false);
 
   const targets = useMemo(() => {
-    const t = stops.filter((s) => s.status !== "concluida").map((s) => ({ key: s.id, label: s.label, address: s.address, lat: s.lat, lng: s.lng }));
+    const t = stops.filter((s) => s.status !== "concluida").map((s) => ({ key: s.id, label: s.label, address: s.address, complement: s.order?.complement || s.complement || "", os_number: s.os_number, lat: s.lat, lng: s.lng }));
     if (returnToBase && base) t.push({ key: "base", label: "Base operacional", address: base.address, lat: base.lat, lng: base.lng });
     return t;
   }, [stops, returnToBase, base]);

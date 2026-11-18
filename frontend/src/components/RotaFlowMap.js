@@ -372,7 +372,7 @@ function Workspace({ config, routeId, routeName, orders, onPersistOrders, onView
         onRecenter={recenter} following={follow && session.active}
         className={`absolute z-20 ${session.active ? "right-3 sm:right-5 top-[38%]" : isDesktop ? "right-5 bottom-8" : "right-3 top-3"}`} />
       <AnimatePresence>
-        {session.active && <NavigationHUD session={session} following={follow} onOverview={navOverview} onRecenter={recenter}
+        {session.active && <NavigationHUD session={session} following={follow} onOverview={navOverview} onRecenter={recenter} onViewOS={onViewOS}
           onPip={pip.supported ? async () => { if (!(await pip.enter())) toast.error("Não foi possível abrir a janela flutuante neste aparelho."); } : null}
           onSendEta={() => {
             const s = planner.stops.find((x) => x.id === session.targetKey);

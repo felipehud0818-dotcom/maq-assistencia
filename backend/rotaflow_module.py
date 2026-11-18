@@ -348,7 +348,7 @@ async def static_map(lat: float, lng: float, zoom: int = 16, user: dict = Depend
 
 # ─── OSs do sistema como paradas ───
 OS_PROJ = {"_id": 0, "os_number": 1, "customer_name": 1, "address": 1, "number": 1, "neighborhood": 1, "city": 1,
-           "state": 1, "lat": 1, "lng": 1, "phone1": 1, "status": 1}
+           "state": 1, "lat": 1, "lng": 1, "phone1": 1, "status": 1, "complement": 1}
 
 
 async def _os_stop(o: dict) -> dict:

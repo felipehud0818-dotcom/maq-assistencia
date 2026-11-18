@@ -51,6 +51,7 @@ class RouteOS(BaseModel):
     address: Optional[str] = None
     number: Optional[str] = None
     phone1: Optional[str] = None
+    complement: Optional[str] = None
     technician: Optional[str] = None
     conclusion: Optional[str] = None
     observation: Optional[str] = None
@@ -160,7 +161,14 @@ async def list_routes(payload: dict = Depends(verify_token)):
 
 @router.get("/{route_id}")
 async def get_route_by_id(route_id: str, payload: dict = Depends(verify_token)):
-    return await _own_route(get_db(), route_id, payload)
+    db = get_db()
+    route = await _own_route(db, route_id, payload)
+    # Complemento atual da OS — só exibição, nunca entra no cálculo da rota.
+    for o in route.get("orders") or []:
+        so = await db.service_orders.find_one({"os_number": str(o.get("os_number"))}, {"_id": 0, "complement": 1})
+        if so is not None:
+            o["complement"] = so.get("complement") or ""
+    return route
 
 
 @router.post("/")

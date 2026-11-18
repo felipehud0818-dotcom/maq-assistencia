@@ -2352,6 +2352,9 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
   // as OSs de TODAS as sugestões marcadas são unidas (dedupe) e viram a
   // seleção do modal.
   const [selectedSuggestions, setSelectedSuggestions] = useState(new Set());
+  // Técnico vinculado a cada quadro do kanban (key → nome).
+  const [techByKey, setTechByKey] = useState({});
+  const [creatingMany, setCreatingMany] = useState(false);
 
   // Fetch orders with pagination (server-side)
   const [osPage, setOsPage] = useState(1);
@@ -2673,6 +2676,7 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
         return;
       }
       setProximityOptions(regional);
+      setTechByKey(routeTechnician ? Object.fromEntries(regional.map(r => [r.key, routeTechnician])) : {});
       setShowProximityPanel(true);
       toast.success(`${intel.data.grouped} OS conciliadas em ${regional.length} roteiro(s)` + (intel.data.unassigned ? ` · ${intel.data.unassigned} ficaram de fora` : ''));
     } catch (err) {
@@ -2711,6 +2715,91 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
     setShowProximityPanel(false);
     const groupNames = proximityOptions.filter(o => selectedSuggestions.has(o.key)).map(o => o.name).join(' + ');
     toast.success(`${merged.size} OS selecionadas: ${groupNames}`);
+  };
+
+  // Mescla os quadros marcados num único quadro (sem duplicar OS).
+  const mergeSelectedSuggestions = () => {
+    const picked = proximityOptions.filter(o => selectedSuggestions.has(o.key));
+    if (picked.length < 2) { toast.error('Marque ao menos 2 roteiros para mesclar'); return; }
+    const orders = [];
+    const seen = new Set();
+    picked.forEach(p => p.orders.forEach(o => { if (!seen.has(o.os_number)) { seen.add(o.os_number); orders.push(o); } }));
+    const uniq = (arr) => [...new Set(arr.filter(Boolean))];
+    const key = `m${Date.now()}`;
+    const merged = {
+      key, edited: true,
+      name: `Mesclado · ${picked.map(p => p.name.split(' · ')[0]).join(' + ')}`,
+      meta: { ...picked[0].meta, cities: uniq(picked.flatMap(p => p.meta.cities)), neighborhoods: uniq(picked.flatMap(p => p.meta.neighborhoods)).slice(0, 4) },
+      orders,
+    };
+    const firstIdx = proximityOptions.findIndex(o => selectedSuggestions.has(o.key));
+    const rest = proximityOptions.filter(o => !selectedSuggestions.has(o.key));
+    setProximityOptions([...rest.slice(0, firstIdx), merged, ...rest.slice(firstIdx)]);
+    setTechByKey(prev => ({ ...prev, [key]: picked.map(p => prev[p.key]).find(Boolean) || '' }));
+    setSelectedSuggestions(new Set([key]));
+    if (orders.length > MAX_ROUTE_OS) toast.warning(`Roteiro mesclado com ${orders.length} OS (máximo recomendado ${MAX_ROUTE_OS}). Arraste algumas para outro roteiro.`);
+    else toast.success(`${picked.length} roteiros mesclados (${orders.length} OS)`);
+  };
+
+  const routeOrderPayload = (o, seq, technician) => ({
+    os_number: o.os_number,
+    customer_name: o.customer_name || '',
+    neighborhood: o.neighborhood || '',
+    city: o.city || '',
+    address: o.address || '',
+    number: o.number || '',
+    complement: o.complement || '',
+    phone1: o.phone1 || '',
+    technician,
+    conclusion: '',
+    observation: '',
+    sequence: seq,
+    lat: o.lat || null,
+    lng: o.lng || null,
+    attendance_date: o.attendance_date || '',
+    status: o.status || '',
+  });
+
+  // Cria um roteiro salvo para cada quadro marcado, com o técnico vinculado e a ordem do quadro.
+  const createIndividualRoutes = async () => {
+    const picked = proximityOptions.filter(o => selectedSuggestions.has(o.key) && o.orders.length);
+    if (!picked.length) { toast.error('Marque ao menos um roteiro'); return; }
+    const noTech = picked.filter(p => !techByKey[p.key]);
+    if (noTech.length) { toast.error(`Vincule um técnico: ${noTech.map(p => p.name.split(' · ')[0]).join(', ')}`); return; }
+    setCreatingMany(true);
+    let ok = 0;
+    for (const p of picked) {
+      const tech = techByKey[p.key];
+      let distance = p.edited ? '' : `${p.meta.distance_km} km`;
+      let duration = '';
+      if (!p.edited) { const m = p.meta.total_minutes; duration = m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}min` : `${m}min`; }
+      if (p.edited) {
+        try {
+          const r = await axios.post(`${API}/routes/compute-route`, {
+            origin: { lat: BASE_LAT, lng: BASE_LNG }, destination: { lat: BASE_LAT, lng: BASE_LNG },
+            intermediates: p.orders.map(o => ({ lat: o.lat, lng: o.lng })), optimize_waypoint_order: false, round_trip: true,
+          }, getAuthHeader());
+          const legs = r.data.routes?.[0]?.legs || [];
+          const dist = legs.reduce((s, l) => s + (l.distanceMeters || 0), 0);
+          const mins = Math.round(legs.reduce((s, l) => s + (parseInt((l.duration || '0').replace('s', ''), 10) || 0), 0) / 60);
+          if (legs.length) { distance = `${(dist / 1000).toFixed(1)} km`; duration = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}min` : `${mins}min`; }
+        } catch (e) { console.warn('compute-route falhou', e); }
+      }
+      try {
+        await axios.post(`${API}/routes/`, {
+          name: `${p.name.split(' · ').slice(1).join(' · ') || p.name} · ${tech}`,
+          technician: tech,
+          date: routeDate,
+          orders: p.orders.map((o, i) => routeOrderPayload(o, i + 1, tech)),
+          total_distance: distance,
+          total_duration: duration,
+          status: 'Pendente',
+        }, getAuthHeader());
+        ok += 1;
+      } catch (e) { toast.error(`Erro ao criar ${p.name}: ${e.response?.data?.detail || e.message}`); }
+    }
+    setCreatingMany(false);
+    if (ok) { toast.success(`${ok} roteiro(s) criado(s)`); onCreated(); }
   };
 
   const toggleSuggestion = (key) => {
@@ -2861,23 +2950,7 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
     if (!routeTechnician) { toast.error('Informe o técnico'); return; }
     setSaving(true);
     try {
-      const orders = optimizedOrders.map(o => ({
-        os_number: o.os_number,
-        customer_name: o.customer_name || '',
-        neighborhood: o.neighborhood || '',
-        city: o.city || '',
-        address: o.address || '',
-        number: o.number || '',
-        phone1: o.phone1 || '',
-        technician: routeTechnician,
-        conclusion: '',
-        observation: '',
-        sequence: o.sequence,
-        lat: o.lat || null,
-        lng: o.lng || null,
-        attendance_date: o.attendance_date || '',
-        status: o.status || '',
-      }));
+      const orders = optimizedOrders.map(o => routeOrderPayload(o, o.sequence, routeTechnician));
 
       await axios.post(`${API}/routes/`, {
         name: routeName || `Roteiro ${routeDate}`,
@@ -3090,13 +3163,31 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
                       </h4>
                       <div className="flex items-center gap-2">
                         <Button
-                          size="sm"
+                          size="sm" variant="outline"
+                          onClick={mergeSelectedSuggestions}
+                          disabled={selectedSuggestions.size < 2}
+                          className="h-7 text-xs"
+                          data-testid="merge-suggestions-btn"
+                        >
+                          Mesclar ({selectedSuggestions.size})
+                        </Button>
+                        <Button
+                          size="sm" variant="outline"
                           onClick={applyMultipleSuggestions}
                           disabled={selectedSuggestions.size === 0}
                           className="h-7 text-xs"
                           data-testid="apply-multi-suggestions"
                         >
-                          Aplicar ({selectedSuggestions.size})
+                          Usar seleção ({selectedSuggestions.size})
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={createIndividualRoutes}
+                          disabled={selectedSuggestions.size === 0 || creatingMany}
+                          className="h-7 text-xs"
+                          data-testid="create-individual-routes-btn"
+                        >
+                          {creatingMany ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : `Criar roteiros (${selectedSuggestions.size})`}
                         </Button>
                         <Button variant="ghost" size="sm" onClick={() => setShowProximityPanel(false)} className="h-6 w-6 p-0">
                           <X className="h-4 w-4" />
@@ -3104,14 +3195,20 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
                       </div>
                     </div>
                     <p className="text-[10px] text-blue-800/70">
-                      Cada quadro é um roteiro montado automaticamente pela proximidade e tempo de deslocamento,
-                      saindo e voltando à base. Marque vários para combinar ou use um direto.
+                      Cada quadro é um roteiro montado pela proximidade e tempo de deslocamento, saindo e voltando à base.
+                      Arraste OSs entre quadros ou dentro do quadro para organizar, vincule um técnico a cada um e marque
+                      os quadros para criar roteiros individuais ou mesclá-los.
                     </p>
                     <RouteSuggestionsKanban
                       options={proximityOptions}
+                      onChange={setProximityOptions}
                       selected={selectedSuggestions}
                       onToggle={toggleSuggestion}
                       onApply={applyProximitySuggestion}
+                      technicians={technicianNames}
+                      techByKey={techByKey}
+                      onTech={(k, t) => setTechByKey(prev => ({ ...prev, [k]: t }))}
+                      maxStops={MAX_ROUTE_OS}
                     />
                   </div>
                 )}
@@ -3461,7 +3558,7 @@ const ViewRouteModal = ({ open, onClose, route, token, onUpdated, technicianName
       // prevents the inner map dialog from tearing down GPS navigation on
       // every poll (polling was causing the start/stop oscillation).
       setOrders(prev => {
-        const key = (o) => `${o.os_number}|${o.lat||''}|${o.lng||''}|${o.sequence||0}|${o.conclusion||''}|${o.observation||''}|${o.status||''}`;
+        const key = (o) => `${o.os_number}|${o.lat||''}|${o.lng||''}|${o.sequence||0}|${o.conclusion||''}|${o.observation||''}|${o.status||''}|${o.complement||''}`;
         const prevSig = (prev || []).map(key).join('::');
         const newSig = newOrders.map(key).join('::');
         return prevSig === newSig ? prev : newOrders;
@@ -3786,6 +3883,7 @@ const ViewRouteModal = ({ open, onClose, route, token, onUpdated, technicianName
                     </Button>
                   </div>
                   <div className="text-xs text-gray-500">{o.address} {o.number}, {o.neighborhood} - {o.city}</div>
+                  {o.complement && <div className="text-xs text-gray-600" data-testid={`route-os-complement-${o.os_number}`}><span className="font-medium">Complemento:</span> {o.complement}</div>}
                   {o.phone1 && userRole !== 'technician' && <div className="text-xs text-gray-500"><Phone className="h-3 w-3 inline mr-1" />{o.phone1}</div>}
                   {/* ETA - Previsão de chegada (Slider) */}
                   <div className="mt-2 space-y-2">

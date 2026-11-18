@@ -2,7 +2,7 @@ import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowUp, ArrowUpLeft, ArrowUpRight, ChevronDown, ChevronUp, CornerUpLeft, CornerUpRight, Flag, Gauge, Loader2, Map as MapIcon, MessageCircle,
-  Merge, Pause, Play, PictureInPicture2, RefreshCcw, RotateCcw, RotateCw, Ship, SkipForward, Volume2, VolumeX, WifiOff, X, Shuffle, CheckCircle2, PartyPopper,
+  Eye, Merge, Pause, Play, PictureInPicture2, RefreshCcw, RotateCcw, RotateCw, Ship, SkipForward, Volume2, VolumeX, WifiOff, X, Shuffle, CheckCircle2, PartyPopper,
 } from "lucide-react";
 import { fmtClock, fmtDist, fmtDur } from "@/lib/geo";
 
@@ -59,7 +59,7 @@ function Banner({ session }) {
   );
 }
 
-function BottomBar({ session, following, onOverview, onRecenter, onSendEta, onPip }) {
+function BottomBar({ session, following, onOverview, onRecenter, onSendEta, onPip, onViewOS }) {
   const { nav, target, paused, gpsMode, simSpeed, setSimSpeed, voice, setVoice, remainingTargets } = session;
   const [collapsed, setCollapsed] = useState(false);
   const eta = nav ? fmtClock(new Date(Date.now() + nav.remainingS * 1000)) : "--:--";
@@ -79,6 +79,8 @@ function BottomBar({ session, following, onOverview, onRecenter, onSendEta, onPi
           <p className="font-mono text-2xl font-bold text-emerald-300 leading-none" data-testid="nav-remaining-time">{nav ? fmtDur(nav.remainingS) : "--"}</p>
           <p className="font-mono text-xs text-slate-300 mt-1" data-testid="nav-remaining-distance">{nav ? fmtDist(nav.remaining) : "--"} · chegada {eta}</p>
           <p className="text-[11px] text-slate-500 truncate mt-0.5" data-testid="nav-target-label">{target?.label}</p>
+          {target?.address && <p className="text-[11px] text-slate-300 leading-snug mt-0.5 line-clamp-2" data-testid="nav-target-address">{target.address}</p>}
+          {target?.complement && <p className="text-[11px] text-amber-300 leading-snug truncate" data-testid="nav-target-complement">Compl.: {target.complement}</p>}
         </div>
         <button onClick={following ? onOverview : onRecenter} className="rf-round" aria-label={following ? "Visão geral" : "Recentralizar"} data-testid="nav-overview-button">
           {following ? <MapIcon className="h-5 w-5" /> : <ArrowUp className="h-5 w-5" />}
@@ -89,6 +91,7 @@ function BottomBar({ session, following, onOverview, onRecenter, onSendEta, onPi
         <button onClick={session.togglePause} className="rf-pill" data-testid="pause-navigation-button">
           {paused ? <><Play className="h-4 w-4" />Retomar</> : <><Pause className="h-4 w-4" />Pausar</>}
         </button>
+        {onViewOS && target?.os_number && <button onClick={() => onViewOS(target.os_number)} className="rf-pill" data-testid="nav-view-os-button"><Eye className="h-4 w-4" />Ver OS</button>}
         {onSendEta && target?.key !== "base" && <button onClick={onSendEta} className="rf-pill" data-testid="nav-send-eta-button"><MessageCircle className="h-4 w-4" />Enviar previsão</button>}
         {onPip && <button onClick={onPip} className="rf-pill" data-testid="nav-pip-button"><PictureInPicture2 className="h-4 w-4" />Janela flutuante</button>}
         {hasNext && <button onClick={() => session.proceed(false)} className="rf-pill" data-testid="next-stop-button"><SkipForward className="h-4 w-4" />Próxima parada</button>}
@@ -143,7 +146,7 @@ function ArrivalModal({ session }) {
   );
 }
 
-export function NavigationHUD({ session, following, onOverview, onRecenter, onSendEta, onPip }) {
+export function NavigationHUD({ session, following, onOverview, onRecenter, onSendEta, onPip, onViewOS }) {
   return (
     <div className="absolute inset-0 z-30 pointer-events-none flex flex-col justify-between p-3 sm:p-5" data-testid="navigation-hud">
       <div className="w-full sm:max-w-md rf-hud-top">
@@ -153,7 +156,7 @@ export function NavigationHUD({ session, following, onOverview, onRecenter, onSe
         )}
       </div>
       <div className="w-full sm:max-w-md rf-hud-bottom">
-        <BottomBar session={session} following={following} onOverview={onOverview} onRecenter={onRecenter} onSendEta={onSendEta} onPip={onPip} />
+        <BottomBar session={session} following={following} onOverview={onOverview} onRecenter={onRecenter} onSendEta={onSendEta} onPip={onPip} onViewOS={onViewOS} />
       </div>
       <AnimatePresence><ArrivalModal session={session} /></AnimatePresence>
     </div>
