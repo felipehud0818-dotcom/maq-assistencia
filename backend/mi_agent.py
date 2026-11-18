@@ -81,6 +81,9 @@ ACTIONS_PROMPT = (
     '- {"type":"update_route","route":"nome ou id","fields":{"date":"AAAA-MM-DD","technician":"...","status":"Pendente|Em andamento|Concluído|Cancelado","name":"..."},'
     '"add_os":["..."],"remove_os":["..."]}\n'
     '- {"type":"update_os","os_number":"...","fields":{"status":"...","technician":"...","observations":"...","attendance_date":"AAAA-MM-DD", ...}}\n'
+    "  Campos aceitos também: visit_fee (Taxa de Visita, número em reais, ex. 150), visit_fee_paid (true/false), e os Dados para Laudo: "
+    "technical_diagnosis, required_parts, installation_correct (SIM|NÃO|NÃO VERIFICADO), voltage_f1f2, voltage_f1_terra, voltage_f2_terra, "
+    "serial_number, batch. Para registrar taxa de visita use SEMPRE o campo visit_fee (não só observações).\n"
     '- {"type":"create_os","fields":{"customer_name":"...","phone1":"...","cep":"...","address":"...","number":"...","complement":"...",'
     '"neighborhood":"...","city":"...","product":"...","brand":"...","model":"...","reported_defect":"...","service_type":"..."}} '
     "(número da OS é gerado automaticamente se não informado)\n"
@@ -104,7 +107,8 @@ ACTIONS_PROMPT = (
 )
 OS_EDITABLE = {"status", "technician", "observations", "attendance_date", "priority", "reported_defect", "technical_diagnosis",
                "required_parts", "customer_name", "phone1", "address", "number", "neighborhood", "city", "model",
-               "serial_number", "product", "service_type"}
+               "serial_number", "product", "service_type", "visit_fee", "visit_fee_paid", "installation_correct",
+               "voltage_f1f2", "voltage_f1_terra", "voltage_f2_terra", "batch"}
 CONFIRM_TYPES = {"create_route", "update_route", "update_os", "create_os", "send_whatsapp", "delete_os", "sync_orders", "generate_laudo"}
 CREATE_OS = None  # injetado pelo server.py (cria OS reutilizando o endpoint)
 SYNC_ORDERS = None  # injetado pelo server.py (sync Hisense + HQ)
@@ -210,6 +214,14 @@ async def execute(db, a: dict, payload: dict = None):
         fields = {k: v for k, v in (a.get("fields") or {}).items() if k in OS_EDITABLE}
         if not fields:
             raise ValueError("Nenhum campo permitido para alterar")
+        if "visit_fee" in fields:
+            try:
+                fields["visit_fee"] = round(float(str(fields["visit_fee"]).replace("R$", "").replace(".", "").replace(",", ".")
+                                                if "," in str(fields["visit_fee"]) else str(fields["visit_fee"]).replace("R$", "")), 2)
+            except ValueError:
+                raise ValueError(f"Taxa de visita inválida: {fields['visit_fee']}")
+        if "visit_fee_paid" in fields:
+            fields["visit_fee_paid"] = str(fields["visit_fee_paid"]).strip().lower() in ("true", "1", "sim", "paga", "pago")
         fields["updated_at"] = datetime.now(timezone.utc).isoformat()
         if "observations" in fields:  # acrescenta, não apaga (ex: "[SITE] Taxa de visita PAGA")
             cur = await db.service_orders.find_one({"os_number": str(a.get("os_number"))}, {"observations": 1}) or {}
@@ -218,6 +230,11 @@ async def execute(db, a: dict, payload: dict = None):
         res = await db.service_orders.update_one({"os_number": str(a.get("os_number"))}, {"$set": fields})
         if not res.matched_count:
             raise ValueError(f"OS {a.get('os_number')} não encontrada")
+        if {"status", "visit_fee", "visit_fee_paid"} & set(fields):
+            import finance_module
+            o = await db.service_orders.find_one({"os_number": str(a.get("os_number"))}, {"_id": 0})
+            if o:
+                await finance_module.on_os_updated(o)
         return f"OS {a.get('os_number')} atualizada."
     raise ValueError(f"Ação desconhecida: {t}")
 

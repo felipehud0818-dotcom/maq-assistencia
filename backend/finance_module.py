@@ -89,15 +89,32 @@ async def current_user(credentials: HTTPAuthorizationCredentials = Depends(_bear
             "finance_access": u.get("finance_access") or "own", "commission_pct": u.get("commission_pct", 0)}
 
 
-async def require_finance(user: dict = Depends(current_user)) -> dict:
+FIN_UNLOCK_TTL = 8 * 3600
+_unlock_fails: dict = {}
+
+
+def _unlock_sig(uid: str, exp: str) -> str:
+    return hmac.new(os.environ["JWT_SECRET"].encode(), f"fin:{uid}:{exp}".encode(), "sha256").hexdigest()
+
+
+def check_unlocked(request: Request, user: dict):
+    """Financeiro exige a senha própria (token curto no header X-Finance-Unlock), mesmo para admin."""
+    exp, _, sig = (request.headers.get("x-finance-unlock") or "").partition(".")
+    if not (exp.isdigit() and int(exp) > time.time() and hmac.compare_digest(sig, _unlock_sig(user["id"], exp))):
+        raise HTTPException(423, "Financeiro bloqueado: digite a senha")
+
+
+async def require_finance(request: Request, user: dict = Depends(current_user)) -> dict:
     if user["role"] != "admin" and user.get("finance_access") != "own":
         raise HTTPException(403, "Sem acesso ao financeiro")
+    check_unlocked(request, user)
     return user
 
 
-async def require_admin(user: dict = Depends(current_user)) -> dict:
+async def require_admin(request: Request, user: dict = Depends(current_user)) -> dict:
     if user["role"] != "admin":
         raise HTTPException(403, "Apenas administradores")
+    check_unlocked(request, user)
     return user
 
 
@@ -212,11 +229,20 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
                 await M.fin_transactions.delete_one({"id": existing["id"]})
             return
         status = "pago" if order.get("visit_fee_paid") else "previsto"
-        when = str(order.get("registration_date") or order.get("created_at") or "")[:10] or today()
+        # Paga: entra na data em que foi marcada como paga. A receber: data de cadastro da OS.
+        reg = str(order.get("registration_date") or order.get("created_at") or "")[:10]
+        paid_on = str(order.get("updated_at") or "")[:10] or today()
         if existing:
-            if not existing.get("reconciled") and existing.get("auto") and (existing["amount"] != fee or existing["status"] != status or existing["date"] != when):
+            if existing.get("reconciled") or not existing.get("auto"):
+                return
+            if status == "pago":
+                when = existing["date"] if existing["status"] == "pago" and existing["date"] != reg else paid_on
+            else:
+                when = reg or existing["date"]
+            if existing["amount"] != round(fee, 2) or existing["status"] != status or existing["date"] != when:
                 await M.fin_transactions.update_one({"id": existing["id"]}, {"$set": {"amount": round(fee, 2), "status": status, "date": when}})
             return
+        when = paid_on if status == "pago" else (reg or today())
         if await M.fin_transactions.find_one({"os_ids": num, "source": "os"}):
             return
         cats = await system_cats()
@@ -366,6 +392,23 @@ class MoveIn(BaseModel):
 def validate_category(body: CategoryIn):
     if body.type not in GROUPS or body.group not in GROUPS[body.type]:
         raise HTTPException(400, "Tipo ou grupo inválido")
+
+
+class UnlockIn(BaseModel):
+    password: str
+
+
+@router.post("/finance/unlock")
+async def finance_unlock(body: UnlockIn, user: dict = Depends(current_user)):
+    fails = [t for t in _unlock_fails.get(user["id"], []) if time.time() - t < 300]
+    if len(fails) >= 5:
+        raise HTTPException(429, "Muitas tentativas. Aguarde 5 minutos.")
+    if not hmac.compare_digest(body.password.encode(), os.environ["FINANCE_PASSWORD"].encode()):
+        _unlock_fails[user["id"]] = fails + [time.time()]
+        raise HTTPException(401, "Senha incorreta")
+    _unlock_fails.pop(user["id"], None)
+    exp = str(int(time.time()) + FIN_UNLOCK_TTL)
+    return {"token": f"{exp}.{_unlock_sig(user['id'], exp)}", "expires_at": int(exp)}
 
 
 @router.get("/finance/me")

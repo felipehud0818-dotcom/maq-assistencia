@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { LayoutDashboard, ArrowDownToLine, ArrowUpFromLine, Tags, Repeat, Target, Users, Landmark, Bot, Lock, Loader2 } from 'lucide-react';
 import DashboardLayout from '../components/DashboardLayout';
-import { api } from '../components/finance/api';
+import { api, errMsg, getUnlock, setUnlock, clearUnlock } from '../components/finance/api';
+import { Input } from '../components/ui/input';
+import { Button } from '../components/ui/button';
 import { RefDataProvider } from '../components/finance/RefData';
 import Overview from '../components/finance/Overview';
 import Transactions from '../components/finance/Transactions';
@@ -35,17 +37,57 @@ function Blocked() {
   );
 }
 
+function LockScreen({ onUnlocked }) {
+  const [pwd, setPwd] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr('');
+    try {
+      const r = await api.post('/finance/unlock', { password: pwd });
+      setUnlock(r.data);
+      onUnlocked();
+    } catch (ex) { setErr(errMsg(ex)); setPwd(''); }
+    setBusy(false);
+  };
+  return (
+    <form onSubmit={submit} className="max-w-sm mx-auto mt-20 p-8 text-center border border-slate-200 rounded-xl bg-white space-y-4" data-testid="finance-lock-screen">
+      <Lock className="mx-auto text-slate-500" />
+      <div>
+        <h1 className="text-xl font-semibold text-slate-900">Financeiro protegido</h1>
+        <p className="text-sm text-slate-500 mt-1">Digite a senha do financeiro para continuar.</p>
+      </div>
+      <Input type="password" inputMode="numeric" autoFocus value={pwd} onChange={(e) => setPwd(e.target.value)} placeholder="Senha" className="text-center tracking-[0.4em]" data-testid="finance-lock-input" />
+      {err && <p className="text-sm text-red-600" data-testid="finance-lock-error">{err}</p>}
+      <Button type="submit" disabled={!pwd || busy} className="w-full" data-testid="finance-lock-submit">
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Desbloquear'}
+      </Button>
+    </form>
+  );
+}
+
 export default function FinancialPage() {
   const { tab = 'visao-geral' } = useParams();
   const navigate = useNavigate();
   const [me, setMe] = useState(null);
+  const [unlocked, setUnlocked] = useState(() => !!getUnlock());
 
   useEffect(() => {
     api.get('/finance/me').then((r) => setMe(r.data)).catch(() => setMe({ has_finance: false }));
   }, []);
 
+  useEffect(() => {
+    const relock = () => setUnlocked(false);
+    window.addEventListener('finance-locked', relock);
+    const t = setInterval(() => { if (!getUnlock()) setUnlocked(false); }, 60000);
+    return () => { window.removeEventListener('finance-locked', relock); clearInterval(t); };
+  }, []);
+
   if (!me) return <DashboardLayout><div className="py-20 text-center text-slate-500"><Loader2 className="h-5 w-5 animate-spin inline mr-2" />Carregando…</div></DashboardLayout>;
   if (!me.has_finance) return <DashboardLayout><Blocked /></DashboardLayout>;
+  if (!unlocked) return <DashboardLayout><LockScreen onUnlocked={() => setUnlocked(true)} /></DashboardLayout>;
 
   const tabs = TABS.filter((t) => me.is_admin || t.tech);
   const current = tabs.find((t) => t.id === tab) || tabs[0];
@@ -55,7 +97,10 @@ export default function FinancialPage() {
       <RefDataProvider>
         <div className="space-y-6 text-slate-900" data-testid="financial-page">
           <div className="border-b border-slate-200">
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">Financeiro</h1>
+            <div className="flex items-center justify-between gap-3">
+              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">Financeiro</h1>
+              <Button variant="outline" size="sm" onClick={clearUnlock} data-testid="finance-lock-btn"><Lock size={14} className="mr-1" />Bloquear</Button>
+            </div>
             <p className="text-sm text-slate-500 mt-1">Quanto entrou, quanto saiu, quanto cada OS rendeu e quanto falta receber.</p>
             <div className="flex gap-1 mt-4 overflow-x-auto -mb-px" data-testid="finance-tabs">
               {tabs.map(({ id, label, Icon }) => (

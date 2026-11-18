@@ -25,6 +25,8 @@ OS_FIELDS = [
     "reported_defect", "technical_diagnosis", "required_parts", "address", "number", "complement", "city", "neighborhood",
     "reference_point", "cep", "phone2", "email", "visit_fee_paid", "lat", "lng", "serial_number",
     "registration_date", "attendance_date", "technician", "phone1", "observations", "updated_at",
+    # Dados para Laudo + taxa de visita
+    "installation_correct", "voltage_f1f2", "voltage_f1_terra", "voltage_f2_terra", "batch", "visit_fee",
 ]
 STOP = set("""a o as os um uma de da do das dos em no na nos nas e ou que qual quais quanto quantos quantas
 como para por com sem se ser sao tem ter foi esta estao isso esse essa este me meu minha voce mi
@@ -416,6 +418,13 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
         await _load_os(db)
         hist_q = " ".join(m["content"] for m in history if m["role"] == "user")[-400:]
         os_hits = _search_os(f"{text} {hist_q}")
+        # OS citada pelo número: busca direto no banco (cache pode estar até 10 min atrasado).
+        fresh = {}
+        for n in list(dict.fromkeys(re.findall(r"\d{4,}", f"{text} {hist_q}")))[:10]:
+            f = await db.service_orders.find_one({"os_number": n}, {k: 1 for k in OS_FIELDS})
+            if f:
+                fresh[n] = f
+        os_hits = [fresh.pop(str(d.get("os_number")), d) for d in os_hits] + list(fresh.values())
         man_hits = await _search_manuals(mongo_db, f"{text} {hist_q[-150:]}", limit=10)
         geo_txt = _geo_context(text) or _geo_context(f"{text} {hist_q}")
         region_txt = mi_agent.region_context(text, _os_cache["docs"])
