@@ -6,13 +6,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { api, errMsg } from "@/components/finance/api";
-import { METHODS, STATUSES, todayIso, brl } from "@/lib/format";
+import { STATUSES, todayIso, brl } from "@/lib/format";
 import { useRef_ } from "@/components/finance/RefData";
-import { SimpleSelect } from "@/components/finance/common";
+import { SimpleSelect, PaymentFields } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const blank = (type, preset) => ({
-  type, date: todayIso(), amount: "", description: "", category_id: "", payment_method: "pix", status: "pago",
+  type, date: todayIso(), amount: "", description: "", category_id: "", payment_method: "pix", credit_mode: null, installments: null, status: "pago",
   os_ids: [], technician_id: null, part_name: "", ...preset,
 });
 
@@ -91,8 +91,12 @@ export default function TxForm({ open, onClose, type, initial, preset, onSaved }
       toast.error("Preencha descrição, valor e categoria");
       return;
     }
+    if (f.payment_method === "credito" && f.credit_mode === "parcelado" && !(Number(f.installments) >= 2)) {
+      toast.error("Informe o número de parcelas");
+      return;
+    }
     setSaving(true);
-    const body = { ...f, amount: Number(f.amount), part_name: f.part_name || null, technician_id: f.technician_id || null };
+    const body = { ...f, amount: Number(f.amount), installments: f.installments ? Number(f.installments) : null, part_name: f.part_name || null, technician_id: f.technician_id || null };
     try {
       if (initial) await api.put(`/finance/transactions/${initial.id}`, body);
       else await api.post("/finance/transactions", body);
@@ -115,7 +119,7 @@ export default function TxForm({ open, onClose, type, initial, preset, onSaved }
           <Field label="Data"><Input type="date" value={f.date} onChange={(e) => set("date")(e.target.value)} data-testid="tx-form-date" /></Field>
           <Field label="Valor (R$)"><Input type="number" step="0.01" min="0" value={f.amount} onChange={(e) => set("amount")(e.target.value)} data-testid="tx-form-amount" /></Field>
           <Field label="Categoria"><SimpleSelect className="w-full" value={f.category_id} onChange={set("category_id")} placeholder="Escolha" testId="tx-form-category" options={cats.map((c) => ({ value: c.id, label: c.name }))} /></Field>
-          <Field label="Forma de pagamento"><SimpleSelect className="w-full" value={f.payment_method} onChange={set("payment_method")} testId="tx-form-method" options={Object.entries(METHODS).map(([value, label]) => ({ value, label }))} /></Field>
+          <PaymentFields f={f} setF={setF} testPrefix="tx-form" wrap={(label, el) => <Field label={label}>{el}</Field>} />
           <Field label="Status"><SimpleSelect className="w-full" value={f.status} onChange={set("status")} testId="tx-form-status" options={Object.entries(STATUSES).map(([value, label]) => ({ value, label }))} /></Field>
           <Field label="Técnico"><SimpleSelect className="w-full" value={f.technician_id || "none"} onChange={(v) => set("technician_id")(v === "none" ? null : v)} testId="tx-form-technician" options={[{ value: "none", label: "Nenhum" }, ...techs.map((t) => ({ value: t.id, label: t.name }))]} /></Field>
           {isPart && <div className="col-span-2"><Field label="Peça vendida"><Input value={f.part_name} onChange={(e) => set("part_name")(e.target.value)} placeholder="Ex.: Capacitor 35uF" data-testid="tx-form-part" /></Field></div>}

@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { api, errMsg } from "@/components/finance/api";
 import { brl, fmtDate } from "@/lib/format";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, SectionTitle, SimpleSelect, Empty } from "@/components/finance/common";
+import { Card, SectionTitle, SimpleSelect, Empty, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const CreateDialog = ({ state, onClose, onSaved }) => {
@@ -130,6 +130,10 @@ export default function Banks() {
   return (
     <>
       <SectionTitle title="Bancos" subtitle="Open Finance via Pluggy (ambiente de testes): importe o extrato e concilie com lançamentos e OSs.">
+        <ExportButton filename="extrato-bancario" sheets={() => ({
+          Extrato: txs.map((bt) => ({ Data: bt.date ? new Date(bt.date).toLocaleDateString("pt-BR") : "", "Descrição": bt.description, Valor: bt.amount, "Conciliação": bt.status || (bt.transaction_id ? "Vinculado" : "Pendente") })),
+          Contas: items.flatMap((it) => it.accounts.map((a) => ({ Banco: it.connector, Conta: a.name, Saldo: a.balance }))),
+        })} />
         <Button className="bg-blue-600 hover:bg-blue-700" onClick={connect} disabled={!configured || busy} data-testid="bank-connect-btn"><Landmark size={16} className="mr-1" />Conectar banco</Button>
       </SectionTitle>
       {configured === false && <Card className="p-4 border-amber-200 bg-amber-50/50 text-sm text-amber-900" data-testid="bank-not-configured">As credenciais do Pluggy ainda não foram configuradas no servidor (PLUGGY_ID e PLUGGY_SECRET).</Card>}

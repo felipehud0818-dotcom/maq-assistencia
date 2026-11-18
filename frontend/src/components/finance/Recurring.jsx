@@ -6,9 +6,9 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { api, errMsg } from "@/components/finance/api";
-import { brl, fmtDate, METHODS, todayIso } from "@/lib/format";
+import { brl, fmtDate, METHODS, todayIso, methodLabel, STATUSES } from "@/lib/format";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, SectionTitle, SimpleSelect, StatusBadge, Empty } from "@/components/finance/common";
+import { Card, SectionTitle, SimpleSelect, StatusBadge, Empty, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const daysUntil = (d) => Math.round((new Date(`${d}T12:00:00`) - new Date(`${todayIso()}T12:00:00`)) / 86400000);
@@ -36,7 +36,7 @@ const RecForm = ({ state, onClose, onSaved }) => {
           <div className="space-y-1.5"><Label className="text-xs">Valor mensal (R$)</Label><Input type="number" step="0.01" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} data-testid="recurring-form-amount" /></div>
           <div className="space-y-1.5"><Label className="text-xs">Dia do vencimento</Label><Input type="number" min="1" max="31" value={f.day_of_month} onChange={(e) => setF({ ...f, day_of_month: e.target.value })} data-testid="recurring-form-day" /></div>
           <div className="space-y-1.5"><Label className="text-xs">Categoria</Label><SimpleSelect className="w-full" value={f.category_id} onChange={(v) => setF({ ...f, category_id: v })} placeholder="Escolha" testId="recurring-form-category" options={categories.filter((c) => c.type === "saida").map((c) => ({ value: c.id, label: c.name }))} /></div>
-          <div className="space-y-1.5"><Label className="text-xs">Forma de pagamento</Label><SimpleSelect className="w-full" value={f.payment_method} onChange={(v) => setF({ ...f, payment_method: v })} testId="recurring-form-method" options={Object.entries(METHODS).map(([value, label]) => ({ value, label }))} /></div>
+          <div className="space-y-1.5"><Label className="text-xs">Forma de pagamento</Label><SimpleSelect className="w-full" value={f.payment_method} onChange={(v) => setF({ ...f, payment_method: v })} testId="recurring-form-method" options={Object.entries(METHODS).filter(([v]) => v !== "credito").map(([value, label]) => ({ value, label }))} /></div>
           <label className="col-span-2 flex items-center gap-2 text-sm"><Switch checked={f.active} onCheckedChange={(v) => setF({ ...f, active: v })} data-testid="recurring-form-active" />Ativa (lança todo mês)</label>
         </div>
         <DialogFooter>
@@ -80,6 +80,7 @@ export default function Recurring() {
   return (
     <>
       <SectionTitle title="Despesas Fixas" subtitle={`Cadastre uma vez e o sistema lança todo mês. Total mensal ativo: ${brl(total)}`}>
+        <ExportButton filename="despesas-fixas" sheets={() => ({ "Despesas fixas": items.map((r) => ({ "Descrição": r.description, Categoria: catById[r.category_id]?.name || "", "Vence dia": r.day_of_month, Forma: methodLabel(r), Ativa: r.active ? "Sim" : "Não", "Este mês": r.current ? STATUSES[r.current.status] || r.current.status : "Não lançada", Valor: r.amount })) })} />
         <Button className="bg-blue-600 hover:bg-blue-700" onClick={() => setState({})} data-testid="new-recurring-btn"><Plus size={16} className="mr-1" />Nova despesa fixa</Button>
       </SectionTitle>
       {alerts.length > 0 && (

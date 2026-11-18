@@ -5,8 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api, errMsg } from "@/components/finance/api";
-import { METHODS, todayIso, brl } from "@/lib/format";
-import { SimpleSelect } from "@/components/finance/common";
+import { todayIso, brl } from "@/lib/format";
+import { SimpleSelect, PaymentFields } from "@/components/finance/common";
 import { OsPicker } from "@/components/finance/TxForm";
 import { toast } from "sonner";
 
@@ -17,7 +17,7 @@ const Stat = ({ label, value, tone = "text-slate-900", testId }) => (
   </div>
 );
 
-const emptyForm = { service_value: "", fee_value: "", parts: [], payment_method: "pix", status: "previsto", date: todayIso() };
+const emptyForm = { service_value: "", fee_value: "", parts: [], payment_method: "pix", credit_mode: null, installments: null, status: "previsto", date: todayIso() };
 
 function PartsEditor({ parts, setParts }) {
   const upd = (i, k, v) => setParts(parts.map((p, j) => (j === i ? { ...p, [k]: v } : p)));
@@ -58,7 +58,7 @@ export default function OsFinanceDialog({ open, onClose, onSaved }) {
   const save = async () => {
     setSaving(true);
     try {
-      const body = { ...f, service_value: Number(f.service_value || 0), fee_value: Number(f.fee_value || 0),
+      const body = { ...f, installments: f.installments ? Number(f.installments) : null, service_value: Number(f.service_value || 0), fee_value: Number(f.fee_value || 0),
         parts: f.parts.filter((p) => p.name).map((p) => ({ name: p.name, qty: Number(p.qty || 1), unit_price: Number(p.unit_price || 0), unit_cost: Number(p.unit_cost || 0) })) };
       const r = await api.post(`/finance/os/${encodeURIComponent(osNum)}/launch`, body);
       toast.success(`${r.data.created} entrada(s) lançada(s) para a OS`);
@@ -85,7 +85,7 @@ export default function OsFinanceDialog({ open, onClose, onSaved }) {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="space-y-1.5"><Label className="text-xs">Serviço (R$)</Label><Input type="number" step="0.01" value={f.service_value} onChange={(e) => setF({ ...f, service_value: e.target.value })} data-testid="os-launch-service" /></div>
               <div className="space-y-1.5"><Label className="text-xs">Taxa (R$)</Label><Input type="number" step="0.01" value={f.fee_value} onChange={(e) => setF({ ...f, fee_value: e.target.value })} data-testid="os-launch-fee" /></div>
-              <div className="space-y-1.5"><Label className="text-xs">Forma</Label><SimpleSelect className="w-full" value={f.payment_method} onChange={(v) => setF({ ...f, payment_method: v })} testId="os-launch-method" options={Object.entries(METHODS).map(([value, label]) => ({ value, label }))} /></div>
+              <PaymentFields f={f} setF={setF} testPrefix="os-launch" wrap={(label, el) => <div className="space-y-1.5"><Label className="text-xs">{label}</Label>{el}</div>} />
               <div className="space-y-1.5"><Label className="text-xs">Status</Label><SimpleSelect className="w-full" value={f.status} onChange={(v) => setF({ ...f, status: v })} testId="os-launch-status" options={[{ value: "previsto", label: "Previsto" }, { value: "pago", label: "Pago" }]} /></div>
               <div className="space-y-1.5 col-span-2"><Label className="text-xs">Data</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} data-testid="os-launch-date" /></div>
             </div>

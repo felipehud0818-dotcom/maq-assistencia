@@ -1,7 +1,9 @@
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
-import { PERIODS, periodRange, STATUSES } from "@/lib/format";
-import { ArrowDownRight, ArrowUpRight, CheckCircle2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { PERIODS, periodRange, STATUSES, METHODS } from "@/lib/format";
+import { exportXlsx } from "@/lib/exportXlsx";
+import { ArrowDownRight, ArrowUpRight, CheckCircle2, FileSpreadsheet } from "lucide-react";
 
 export const Card = ({ className = "", children, ...rest }) => (
   <div className={`bg-white border border-slate-200 rounded-xl shadow-sm ${className}`} {...rest}>{children}</div>
@@ -73,6 +75,26 @@ export const SectionTitle = ({ title, subtitle, children }) => (
     </div>
     {children && <div className="flex flex-wrap items-center gap-2">{children}</div>}
   </div>
+);
+
+export const ExportButton = ({ filename, sheets, testId = "export-excel-btn" }) => (
+  <Button variant="outline" onClick={() => exportXlsx(filename, typeof sheets === "function" ? sheets() : sheets)} data-testid={testId}>
+    <FileSpreadsheet size={16} className="mr-1 text-emerald-600" />Exportar Excel
+  </Button>
+);
+
+// Forma de pagamento; no crédito pede à vista/parcelado e, se parcelado, o nº de parcelas.
+export const PaymentFields = ({ f, setF, testPrefix, wrap = (label, el) => <div className="space-y-1.5"><div className="text-xs text-slate-600">{label}</div>{el}</div> }) => (
+  <>
+    {wrap("Forma de pagamento", <SimpleSelect className="w-full" value={METHODS[f.payment_method] ? f.payment_method : undefined} placeholder="Escolha" testId={`${testPrefix}-method`}
+      onChange={(v) => setF({ ...f, payment_method: v, credit_mode: v === "credito" ? f.credit_mode || "avista" : null, installments: v === "credito" ? f.installments : null })}
+      options={Object.entries(METHODS).map(([value, label]) => ({ value, label }))} />)}
+    {f.payment_method === "credito" && wrap("Crédito", <SimpleSelect className="w-full" value={f.credit_mode || "avista"} testId={`${testPrefix}-credit-mode`}
+      onChange={(v) => setF({ ...f, credit_mode: v, installments: v === "parcelado" ? f.installments || 2 : null })}
+      options={[{ value: "avista", label: "À vista" }, { value: "parcelado", label: "Parcelado" }]} />)}
+    {f.payment_method === "credito" && f.credit_mode === "parcelado" && wrap("Nº de parcelas", <Input type="number" min="2" max="48" value={f.installments ?? ""}
+      onChange={(e) => setF({ ...f, installments: e.target.value === "" ? "" : Number(e.target.value) })} data-testid={`${testPrefix}-installments`} />)}
+  </>
 );
 
 export const Empty = ({ text, testId }) => (

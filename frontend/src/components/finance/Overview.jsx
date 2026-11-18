@@ -5,7 +5,7 @@ import { api, errMsg } from "@/components/finance/api";
 import { brl, fmtDate, change } from "@/lib/format";
 import { useAuth } from "@/context/AuthContext";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, Delta, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty, StatusBadge } from "@/components/finance/common";
+import { Card, Delta, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty, StatusBadge, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const Kpi = ({ id, label, value, delta, invert, hint, tone }) => (
@@ -114,6 +114,12 @@ export default function Overview() {
     <>
       <SectionTitle title="Visão Geral" subtitle={`Comparando com ${fmtDate(data.previous_range.start)} a ${fmtDate(data.previous_range.end)}`}>
         <PeriodFilter period={period} setPeriod={setPeriod} />
+        <ExportButton filename={`visao-geral-${period.start}-a-${period.end}`} sheets={() => ({
+          Resumo: [{ "Entrou (recebido)": c.entradas_pagas, "Saiu (pago)": c.saidas_pagas, Saldo: c.saldo, "Falta receber": c.a_receber, "Em atraso": c.atrasado_receber, "A pagar": c.a_pagar, "Saldo previsto": c.saldo_previsto }],
+          "Por dia": data.series.map((s) => ({ Data: fmtDate(s.date), Entradas: s.entradas, "Saídas": s.saidas })),
+          Categorias: data.by_category.map((x) => ({ Tipo: x.type === "entrada" ? "Entrada" : "Saída", Categoria: x.name, Total: x.total })),
+          Ranking: data.ranking.map((r) => ({ "Técnico": r.name, OS: r.os, Gerado: r.total, Recebido: r.recebido })),
+        })} />
         {isAdmin && <SimpleSelect value={tech} onChange={setTech} testId="filter-technician-select"
           options={[{ value: "all", label: "Todos os técnicos" }, ...techs.map((t) => ({ value: t.id, label: t.name }))]} />}
       </SectionTitle>

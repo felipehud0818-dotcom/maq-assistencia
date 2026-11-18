@@ -3,10 +3,10 @@ import { Plus, Pencil, Trash2, Link2, CheckCircle2, Circle, Package, ClipboardLi
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { api, errMsg } from "@/components/finance/api";
-import { brl, fmtDate, groupKey, groupLabel, METHODS, STATUSES } from "@/lib/format";
+import { brl, fmtDate, groupKey, groupLabel, METHODS, STATUSES, methodLabel } from "@/lib/format";
 import { useAuth } from "@/context/AuthContext";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, StatusBadge, ReconciledBadge, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty } from "@/components/finance/common";
+import { Card, StatusBadge, ReconciledBadge, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty, ExportButton } from "@/components/finance/common";
 import TxForm from "@/components/finance/TxForm";
 import LinkOsDialog from "@/components/finance/LinkOsDialog";
 import OsFinanceDialog from "@/components/finance/OsFinanceDialog";
@@ -46,7 +46,7 @@ const Row = ({ t, isAdmin, catById, osById, techById, onEdit, onDelete, onLink, 
     <td className="px-4 py-3 whitespace-nowrap">
       <span className="inline-flex items-center gap-1.5 text-slate-700"><span className="h-2 w-2 rounded-full" style={{ background: catById[t.category_id]?.color }} />{catById[t.category_id]?.name || "-"}</span>
     </td>
-    <td className="px-4 py-3 text-slate-600">{METHODS[t.payment_method]}</td>
+    <td className="px-4 py-3 text-slate-600 whitespace-nowrap" data-testid={`tx-method-${t.id}`}>{methodLabel(t)}</td>
     <td className="px-4 py-3"><div className="flex flex-col gap-1 items-start"><StatusBadge status={t.status} testId={`tx-status-${t.id}`} />{t.reconciled && <ReconciledBadge />}</div></td>
     <td className="px-4 py-3 text-right font-mono-num font-semibold whitespace-nowrap">{brl(t.amount)}</td>
     {isAdmin && (
@@ -108,9 +108,16 @@ export default function Transactions({ type }) {
   });
 
   const label = type === "entrada" ? "Entradas" : "Saídas";
+  const sheet = () => ({ [label]: rows.map((t) => ({
+    Data: fmtDate(t.date), "Descrição": t.description, Categoria: ref.catById[t.category_id]?.name || "",
+    Forma: methodLabel(t), Status: STATUSES[t.status] || t.status, Valor: t.amount,
+    OS: (t.os_ids || []).map((id) => String(id).trim()).join(", "), "Técnico": ref.techById[t.technician_id]?.name || "",
+    "Peça": t.part_name || "", Conferido: t.reconciled ? "Sim" : "Não",
+  })) });
   return (
     <>
       <SectionTitle title={label} subtitle={type === "entrada" ? "Receitas de OS, vendas avulsas de peças e outras entradas" : "Despesas fixas, variáveis e outras saídas"}>
+        <ExportButton filename={`${label.toLowerCase()}-${period.start}-a-${period.end}`} sheets={sheet} />
         {isAdmin && type === "entrada" && <Button variant="outline" onClick={importDone} title="Lança a taxa de visita das OSs finalizadas no período" data-testid="import-done-os-btn"><DownloadCloud size={16} className="mr-1" />Importar OSs finalizadas</Button>}
         {isAdmin && type === "entrada" && <Button variant="outline" onClick={() => setOsOpen(true)} data-testid="os-finance-btn"><ClipboardList size={16} className="mr-1" />Lançar OS</Button>}
         {isAdmin && type === "entrada" && <Button variant="outline" onClick={() => setForm({ open: true, preset: partPreset })} data-testid="new-part-sale-btn"><Package size={16} className="mr-1" />Venda de peça avulsa</Button>}

@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { api, errMsg } from "@/components/finance/api";
-import { Card, SectionTitle, SimpleSelect, Empty } from "@/components/finance/common";
+import { Card, SectionTitle, SimpleSelect, Empty, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const inline = (s) => s.split(/(\*\*[^*]+\*\*)/g).map((p, i) => (p.startsWith("**") ? <strong key={i}>{p.slice(2, -2)}</strong> : p));
@@ -103,6 +103,7 @@ export default function Assistants() {
   return (
     <>
       <SectionTitle title="Assistentes" subtitle="Assistentes de IA com uma função. Disponível agora: resumo semanal (últimos 7 dias x semana anterior).">
+        <ExportButton filename="assistentes" sheets={() => ({ Assistentes: data.assistants.map((a) => ({ Nome: a.name, "Função": data.functions?.[a.function]?.label || data.functions?.[a.function] || a.function, Ativo: a.active ? "Sim" : "Não", "Instruções": a.instructions })) })} />
         <Button className="bg-blue-600 hover:bg-blue-700" onClick={() => setState({})} data-testid="new-assistant-btn"><Plus size={16} className="mr-1" />Novo assistente</Button>
       </SectionTitle>
       {data.assistants.length === 0 && <Card><Empty text="Nenhum assistente criado" /></Card>}

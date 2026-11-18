@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { api, errMsg } from "@/components/finance/api";
 import { GROUPS } from "@/lib/format";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, SectionTitle, SimpleSelect } from "@/components/finance/common";
+import { Card, SectionTitle, SimpleSelect, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const COLORS = ["#2563EB", "#16A34A", "#D97706", "#9333EA", "#0891B2", "#E11D48", "#4F46E5", "#059669", "#64748B"];
@@ -84,11 +84,13 @@ const Column = ({ type, title, onNew, onEdit }) => {
 };
 
 export default function Categories() {
-  const { reload } = useRef_();
+  const { reload, categories } = useRef_();
   const [state, setState] = useState(null);
   return (
     <>
-      <SectionTitle title="Categorias" subtitle="Crie, edite e organize as categorias. As marcadas com cadeado são usadas na geração automática das OSs." />
+      <SectionTitle title="Categorias" subtitle="Crie, edite e organize as categorias. As marcadas com cadeado são usadas na geração automática das OSs.">
+        <ExportButton filename="categorias" sheets={() => ({ Categorias: categories.map((c) => ({ Tipo: c.type === "entrada" ? "Entrada" : "Saída", Grupo: GROUPS[c.type]?.[c.group] || c.group, Nome: c.name, Sistema: c.system_key ? "Sim" : "Não" })) })} />
+      </SectionTitle>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Column type="entrada" title="Entradas" onNew={(type) => setState({ type })} onEdit={(c) => setState({ type: c.type, initial: c })} />
         <Column type="saida" title="Saídas" onNew={(type) => setState({ type })} onEdit={(c) => setState({ type: c.type, initial: c })} />

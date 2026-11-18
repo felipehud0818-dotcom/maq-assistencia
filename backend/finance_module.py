@@ -4,6 +4,7 @@ import time
 import hmac
 import uuid
 import asyncio
+import re
 import logging
 import calendar
 from datetime import datetime, timezone, date, timedelta
@@ -24,7 +25,8 @@ _verify = None
 _bearer = HTTPBearer()
 TZ = ZoneInfo("America/Sao_Paulo")
 NO_ID = {"_id": 0}
-METHODS = ("cartao", "pix", "dinheiro")
+METHODS = ("debito", "credito", "pix", "dinheiro")
+CREDIT_MODES = ("avista", "parcelado")
 STATUSES = ("previsto", "pago", "atrasado")
 GROUPS = {"entrada": ("servico", "peca", "taxa", "outros"), "saida": ("fixa", "variavel", "outra")}
 DONE_STATUSES = ("Finalizada", "Visita Realizada")
@@ -170,7 +172,18 @@ async def system_cats() -> dict:
     return {c["system_key"]: c["id"] async for c in M.fin_categories.find({"system_key": {"$ne": None}}, NO_ID)}
 
 
-async def os_entries(o: dict, vals: dict, method: str, status: str, when: str):
+def credit_fields(method: str, mode: Optional[str], installments: Optional[int]) -> dict:
+    """Cartão de crédito exige à vista/parcelado; parcelado exige nº de parcelas (2-48)."""
+    if method != "credito":
+        return {"credit_mode": None, "installments": None}
+    if mode not in CREDIT_MODES:
+        raise HTTPException(400, "Cartão de crédito: escolha À vista ou Parcelado")
+    if mode == "parcelado" and not (installments and 2 <= installments <= 48):
+        raise HTTPException(400, "Informe o número de parcelas (2 a 48)")
+    return {"credit_mode": mode, "installments": installments if mode == "parcelado" else 1}
+
+
+async def os_entries(o: dict, vals: dict, method: str, status: str, when: str, credit: Optional[dict] = None):
     cats = await system_cats()
     parts = vals.get("parts") or []
     rows = [("servico", float(vals.get("service_value") or 0), f"Serviço OS #{o['number']} - {o['client']}", None),
@@ -179,36 +192,73 @@ async def os_entries(o: dict, vals: dict, method: str, status: str, when: str):
     docs = [{"id": new_id(), "type": "entrada", "date": when, "amount": round(v, 2), "description": desc,
              "category_id": cats.get(key), "payment_method": method, "status": status, "os_ids": [o["id"]],
              "technician_id": o.get("technician_id"), "part_name": part, "reconciled": False, "source": "os",
-             "os_key": key, "recurring_id": None, "created_at": now_iso()} for key, v, desc, part in rows if v > 0]
+             "os_key": key, "recurring_id": None, "created_at": now_iso(), **(credit or {})} for key, v, desc, part in rows if v > 0]
     if docs:
         await M.fin_transactions.insert_many(docs)
     return len(docs)
 
 
-async def on_os_updated(order: dict):
-    """Chamado após editar uma OS: OS finalizada com taxa de visita gera/atualiza a entrada da taxa."""
+async def on_os_updated(order: dict, techs: Optional[list] = None):
+    """OS com taxa de visita: paga vira entrada recebida; não paga vira valor a receber."""
     try:
         fee = float(order.get("visit_fee") or 0)
         num = order.get("os_number")
-        if not num or fee <= 0 or order.get("status") not in DONE_STATUSES:
+        if not num:
             return
         existing = await M.fin_transactions.find_one({"os_ids": num, "source": "os", "os_key": "taxa"}, NO_ID)
+        cancelled = "cancel" in str(order.get("status") or "").lower()
+        if fee <= 0 or cancelled:
+            if existing and existing.get("auto") and not existing.get("reconciled") and existing["status"] != "pago":
+                await M.fin_transactions.delete_one({"id": existing["id"]})
+            return
         status = "pago" if order.get("visit_fee_paid") else "previsto"
+        when = str(order.get("registration_date") or order.get("created_at") or "")[:10] or today()
         if existing:
-            if not existing.get("reconciled") and existing.get("auto") and (existing["amount"] != fee or existing["status"] != status):
-                await M.fin_transactions.update_one({"id": existing["id"]}, {"$set": {"amount": round(fee, 2), "status": status}})
+            if not existing.get("reconciled") and existing.get("auto") and (existing["amount"] != fee or existing["status"] != status or existing["date"] != when):
+                await M.fin_transactions.update_one({"id": existing["id"]}, {"$set": {"amount": round(fee, 2), "status": status, "date": when}})
             return
         if await M.fin_transactions.find_one({"os_ids": num, "source": "os"}):
             return
         cats = await system_cats()
-        tech = match_tech(order.get("technician"), await technicians())
+        tech = match_tech(order.get("technician"), techs if techs is not None else await technicians())
         await M.fin_transactions.insert_one({
-            "id": new_id(), "type": "entrada", "date": today(), "amount": round(fee, 2),
+            "id": new_id(), "type": "entrada", "date": when, "amount": round(fee, 2),
             "description": f"Taxa OS #{str(num).strip()} - {order.get('customer_name') or ''}", "category_id": cats.get("taxa"),
             "payment_method": "pix", "status": status, "os_ids": [num], "technician_id": tech, "part_name": None,
             "reconciled": False, "source": "os", "os_key": "taxa", "auto": True, "recurring_id": None, "created_at": now_iso()})
     except Exception as exc:
         log.error("on_os_updated %s: %s", order.get("os_number"), exc)
+
+
+_fee_sync = {"at": 0.0, "running": False}
+
+
+async def _sync_fee_entries():
+    try:
+        techs = await technicians()
+        fields = {**OS_FIELDS, "registration_date": 1, "created_at": 1}
+        total, skip = 0, 0
+        while True:  # Supabase devolve no máx. 1000 linhas por consulta
+            rows = await S.service_orders.find({"visit_fee": {"$gte": 0.01}}, fields).sort("os_number", 1).skip(skip).limit(1000).to_list(1000)
+            for r in rows:
+                await on_os_updated(r, techs)
+            total += len(rows)
+            skip += 1000
+            if len(rows) < 1000:
+                break
+        log.warning("sync taxas: %s OS verificadas", total)
+    except Exception as exc:
+        log.error("sync taxas: %s", exc)
+    finally:
+        _fee_sync["running"] = False
+
+
+def sync_fee_entries():
+    """Garante entrada (paga) / a receber (não paga) para toda OS com taxa de visita — no máx. a cada 10 min."""
+    if _fee_sync["running"] or time.time() - _fee_sync["at"] < 600:
+        return
+    _fee_sync.update(at=time.time(), running=True)
+    asyncio.create_task(_sync_fee_entries())
 
 
 async def os_finance(o: dict) -> dict:
@@ -243,6 +293,8 @@ class LaunchIn(BaseModel):
     fee_value: float = Field(0, ge=0)
     parts: List[PartIn] = []
     payment_method: str = "pix"
+    credit_mode: Optional[str] = None
+    installments: Optional[int] = None
     status: str = "previsto"
     date: Optional[str] = None
 
@@ -274,6 +326,7 @@ async def get_os_finance(os_number: str, user: dict = Depends(require_finance)):
 async def launch_os(os_number: str, body: LaunchIn, user: dict = Depends(require_admin)):
     if body.payment_method not in METHODS or body.status not in ("previsto", "pago"):
         raise HTTPException(400, "Forma de pagamento ou status inválido")
+    credit = credit_fields(body.payment_method, body.credit_mode, body.installments)
     o = await get_os(os_number, user)
     if await M.fin_transactions.find_one({"os_ids": os_number, "source": "os", "reconciled": True}):
         raise HTTPException(409, "Esta OS já tem lançamentos conferidos com o extrato")
@@ -283,7 +336,7 @@ async def launch_os(os_number: str, body: LaunchIn, user: dict = Depends(require
         raise HTTPException(400, "Informe ao menos um valor")
     await M.fin_os_values.update_one({"os_number": os_number}, {"$set": vals}, upsert=True)
     await M.fin_transactions.delete_many({"os_ids": os_number, "source": "os"})
-    n = await os_entries(o, vals, body.payment_method, body.status, vals["date"])
+    n = await os_entries(o, vals, body.payment_method, body.status, vals["date"], credit)
     return {"ok": True, "created": n}
 
 
@@ -387,6 +440,8 @@ class TxIn(BaseModel):
     description: str
     category_id: str
     payment_method: str
+    credit_mode: Optional[str] = None
+    installments: Optional[int] = None
     status: str
     os_ids: List[str] = []
     technician_id: Optional[str] = None
@@ -411,7 +466,7 @@ async def validate_tx(body: TxIn) -> dict:
     cat = await M.fin_categories.find_one({"id": body.category_id}, NO_ID)
     if not cat or cat["type"] != body.type:
         raise HTTPException(400, "Categoria inválida para este tipo")
-    data = body.model_dump()
+    data = {**body.model_dump(), **credit_fields(body.payment_method, body.credit_mode, body.installments)}
     data["os_ids"] = await check_os_ids(body.os_ids)
     return data
 
@@ -441,6 +496,7 @@ async def list_transactions(
     payment_method: Optional[str] = None, os_id: Optional[str] = None, limit: int = Query(2000, le=5000),
 ):
     await generate_recurring()
+    sync_fee_entries()
     q = {**scope(user)}
     if type:
         q["type"] = type
@@ -522,6 +578,7 @@ def summarize(txs: list) -> dict:
 @router.get("/finance/overview")
 async def overview(start: str, end: str, technician_id: Optional[str] = None, user: dict = Depends(require_finance)):
     await generate_recurring()
+    sync_fee_entries()
     q = {**scope(user)}
     if technician_id and user["role"] == "admin":
         q["technician_id"] = technician_id
@@ -672,9 +729,44 @@ async def delete_budget(bid: str, _: dict = Depends(require_admin)):
 
 
 # ---------- Técnicos: fechamento ----------
+async def routed_os(start: str, end: str, techs: list) -> dict:
+    """OSs dos roteiros do período agrupadas por técnico (id) — a contagem real de atendimentos."""
+    routes = await S.routes.find({}, NO_ID).to_list(5000)
+    out = {}
+    for r in routes:
+        d = str(r.get("date") or "")[:10]
+        if not d or d < start or d > end:
+            continue
+        # "Felipe/Tulio", "Felipe e Pedro": conta para cada técnico do roteiro.
+        parts = re.split(r"\s*(?:/|,|&|\be\b)\s*", str(r.get("technician") or ""))
+        tids = {t for t in (match_tech(p, techs) for p in parts) if t}
+        for o in (r.get("orders") or []) if tids else []:
+            num = str(o.get("os_number") or "").strip()
+            if not num:
+                continue
+            done = o.get("stop_status") == "completed" or bool((o.get("conclusion") or "").strip())
+            for tid in tids:
+                bucket = out.setdefault(tid, {})
+                prev = bucket.get(num)
+                if prev and (prev["concluida"] or not done):
+                    continue
+                bucket[num] = {"os_number": num, "customer_name": o.get("customer_name") or "", "neighborhood": o.get("neighborhood") or "",
+                           "city": o.get("city") or "", "route_name": r.get("name") or "", "route_date": d,
+                           "route_status": r.get("status") or "", "conclusion": o.get("conclusion") or "", "concluida": done}
+    return {k: sorted(v.values(), key=lambda x: (x["route_date"], x["os_number"])) for k, v in out.items()}
+
+
+@router.get("/finance/technicians/{tech_id}/os")
+async def technician_routed_os(tech_id: str, start: str, end: str, user: dict = Depends(require_finance)):
+    if user["role"] != "admin" and user["id"] != tech_id:
+        raise HTTPException(403, "Sem acesso")
+    return (await routed_os(start, end, await technicians())).get(tech_id, [])
+
+
 @router.get("/finance/technicians")
 async def technicians_closing(start: str, end: str, user: dict = Depends(require_finance)):
     techs = await technicians()
+    routed = await routed_os(start, end, techs)
     if user["role"] != "admin":
         techs = [t for t in techs if t["id"] == user["id"]]
     service_cats = [c["id"] async for c in M.fin_categories.find({"type": "entrada", "group": "servico"}, {"_id": 0, "id": 1})]
@@ -690,6 +782,8 @@ async def technicians_closing(start: str, end: str, user: dict = Depends(require
         repassado = sum(p["amount"] for p in payouts)
         out.append({"technician_id": tech["id"], "name": tech["name"], "commission_pct": tech.get("commission_pct", 0),
                     "finance_access": tech.get("finance_access"), "os_count": len({o for t in txs for o in t.get("os_ids", [])}),
+                    "os_routed": len(routed.get(tech["id"], [])),
+                    "os_routed_done": sum(1 for x in routed.get(tech["id"], []) if x["concluida"]),
                     "gerado": round(sum(t["amount"] for t in txs), 2),
                     "recebido": round(sum(t["amount"] for t in txs if t["status"] == "pago"), 2),
                     "servico_total": round(sum(t["amount"] for t in txs if t["category_id"] in service_cats), 2),
@@ -1169,6 +1263,7 @@ async def list_runs(aid: str, _: dict = Depends(require_admin)):
 
 # ---------- Inicialização ----------
 async def startup():
+    sync_fee_entries()
     if await M.fin_categories.count_documents({}) == 0:
         await M.fin_categories.insert_many([{"id": new_id(), "type": t, "group": g, "name": n, "color": c, "system_key": k, "order": i}
                                             for i, (t, g, n, c, k) in enumerate(DEFAULT_CATEGORIES)])

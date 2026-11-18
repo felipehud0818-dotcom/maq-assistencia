@@ -73,7 +73,13 @@ export const change = (cur, prev) => {
   return ((cur - prev) / Math.abs(prev)) * 100;
 };
 
-export const METHODS = { cartao: "Cartão", pix: "Pix", dinheiro: "Dinheiro" };
+export const METHODS = { debito: "Cartão de Débito", credito: "Cartão de Crédito", pix: "Pix", dinheiro: "Dinheiro" };
+const METHOD_LABELS = { ...METHODS, cartao: "Cartão" };
+export const methodLabel = (t) => {
+  const base = METHOD_LABELS[t?.payment_method] || t?.payment_method || "-";
+  if (t?.payment_method !== "credito") return base;
+  return t.credit_mode === "parcelado" ? `${base} · ${t.installments}x` : `${base} · à vista`;
+};
 export const STATUSES = { previsto: "Previsto", pago: "Pago", atrasado: "Em atraso" };
 export const GROUPS = {
   entrada: { servico: "Serviço", peca: "Peça", taxa: "Taxa", outros: "Outros" },

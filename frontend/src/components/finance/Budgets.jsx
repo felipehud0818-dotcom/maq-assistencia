@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { api, errMsg } from "@/components/finance/api";
 import { brl } from "@/lib/format";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, SectionTitle, SimpleSelect, Empty } from "@/components/finance/common";
+import { Card, SectionTitle, SimpleSelect, Empty, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
 
 const LEVEL = {
@@ -30,7 +30,9 @@ export default function Budgets() {
 
   return (
     <>
-      <SectionTitle title="Metas e Limites" subtitle="Teto mensal por categoria de saída, com aviso ao chegar em 80% e 100%." />
+      <SectionTitle title="Metas e Limites" subtitle="Teto mensal por categoria de saída, com aviso ao chegar em 80% e 100%.">
+        <ExportButton filename="metas-e-limites" sheets={() => ({ Limites: items.map((b) => ({ Categoria: b.category_name, "Limite mensal": b.monthly_limit, Gasto: b.spent, "%": b.pct, "Situação": LEVEL[b.level]?.label || b.level })) })} />
+      </SectionTitle>
       <Card className="p-5 flex flex-wrap items-end gap-3" data-testid="budget-form">
         <div className="space-y-1.5"><div className="text-xs text-slate-600">Categoria</div>
           <SimpleSelect className="w-56" value={cat} onChange={setCat} placeholder="Escolha" testId="budget-form-category" options={categories.filter((c) => c.type === "saida").map((c) => ({ value: c.id, label: c.name }))} />

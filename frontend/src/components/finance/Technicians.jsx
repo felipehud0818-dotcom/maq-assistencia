@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { HandCoins, Save } from "lucide-react";
+import { HandCoins, Save, ListChecks } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -8,8 +8,47 @@ import { api, errMsg } from "@/components/finance/api";
 import { brl, fmtDate, METHODS } from "@/lib/format";
 import { useAuth } from "@/context/AuthContext";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, SectionTitle, PeriodFilter, initialPeriod, SimpleSelect, Empty } from "@/components/finance/common";
+import { Card, SectionTitle, PeriodFilter, initialPeriod, SimpleSelect, Empty, ExportButton } from "@/components/finance/common";
+import { exportXlsx } from "@/lib/exportXlsx";
 import { toast } from "sonner";
+
+const osSheet = (list) => list.map((o) => ({ OS: o.os_number, Cliente: o.customer_name, Bairro: o.neighborhood, Cidade: o.city,
+  Roteiro: o.route_name, Data: fmtDate(o.route_date), "Situação": o.concluida ? "Concluída" : "Pendente", "Conclusão": o.conclusion }));
+
+const RoutedOsDialog = ({ row, period, onClose }) => {
+  const [list, setList] = useState(null);
+  useEffect(() => {
+    if (!row) { setList(null); return; }
+    api.get(`/finance/technicians/${row.technician_id}/os`, { params: { start: period.start, end: period.end } })
+      .then((r) => setList(r.data)).catch((e) => { toast.error(errMsg(e)); setList([]); });
+  }, [row, period.start, period.end]);
+  return (
+    <Dialog open={!!row} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="bg-white max-w-3xl max-h-[85vh] overflow-y-auto" data-testid="tech-os-dialog">
+        <DialogHeader><DialogTitle>OSs dos roteiros · {row?.name}</DialogTitle></DialogHeader>
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-sm text-slate-500">Período {fmtDate(period.start)} a {fmtDate(period.end)} · {list?.length ?? "…"} OS · {list ? list.filter((o) => o.concluida).length : "…"} concluídas</p>
+          <Button variant="outline" size="sm" disabled={!list?.length} onClick={() => exportXlsx(`os-${row.name}-${period.start}-a-${period.end}`, { OSs: osSheet(list) })} data-testid="tech-os-export-btn">Exportar Excel</Button>
+        </div>
+        {!list ? <div className="py-8 text-center text-sm text-slate-500">Carregando…</div> : list.length === 0 ? <Empty text="Nenhuma OS em roteiros no período" /> : (
+          <table className="w-full text-sm" data-testid="tech-os-table">
+            <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-3 py-2 text-left">OS</th><th className="px-3 py-2 text-left">Cliente</th><th className="px-3 py-2 text-left">Roteiro</th><th className="px-3 py-2 text-left">Situação</th></tr></thead>
+            <tbody>
+              {list.map((o) => (
+                <tr key={o.os_number} className="border-t border-slate-100" data-testid={`tech-os-row-${o.os_number}`}>
+                  <td className="px-3 py-2 font-medium whitespace-nowrap">#{o.os_number}</td>
+                  <td className="px-3 py-2">{o.customer_name}<div className="text-xs text-slate-500">{[o.neighborhood, o.city].filter(Boolean).join(" · ")}</div></td>
+                  <td className="px-3 py-2 text-xs">{o.route_name}<div className="text-slate-500">{fmtDate(o.route_date)}</div></td>
+                  <td className="px-3 py-2"><span className={`text-xs px-2 py-0.5 rounded-full border ${o.concluida ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-amber-50 text-amber-700 border-amber-200"}`}>{o.concluida ? "Concluída" : "Pendente"}</span>{o.conclusion && <div className="text-xs text-slate-500 mt-0.5">{o.conclusion}</div>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+};
 
 const PayoutDialog = ({ row, period, onClose, onSaved }) => {
   const [amount, setAmount] = useState("");
@@ -69,6 +108,7 @@ export default function Technicians() {
   const [rows, setRows] = useState([]);
   const [payouts, setPayouts] = useState([]);
   const [payRow, setPayRow] = useState(null);
+  const [osRow, setOsRow] = useState(null);
 
   const load = useCallback(() => {
     api.get("/finance/technicians", { params: { start: period.start, end: period.end } }).then((r) => setRows(r.data)).catch((e) => toast.error(errMsg(e)));
@@ -80,18 +120,28 @@ export default function Technicians() {
     <>
       <SectionTitle title="Técnicos" subtitle="Fechamento do período: valor gerado, comissão, repasses e saldo a repassar.">
         <PeriodFilter period={period} setPeriod={setPeriod} />
+        <ExportButton filename={`tecnicos-${period.start}-a-${period.end}`} sheets={() => ({
+          Fechamento: rows.map((r) => ({ "Técnico": r.name, "OS (roteiros)": r.os_routed, "OS concluídas": r.os_routed_done, "OS com lançamento": r.os_count,
+            Gerado: r.gerado, Recebido: r.recebido, "Serviço recebido": r.servico_pago, "Comissão %": r.commission_pct, "Comissão": r.comissao, Repassado: r.repassado, "A repassar": r.a_repassar })),
+          Repasses: payouts.map((p) => ({ Data: fmtDate(p.paid_at), "Técnico": p.technician_name, "Início": fmtDate(p.period_start), Fim: fmtDate(p.period_end), Valor: p.amount })),
+        })} />
       </SectionTitle>
       <Card className="overflow-x-auto">
         {rows.length === 0 ? <Empty text="Nenhum técnico" /> : (
           <table className="w-full text-sm" data-testid="tech-closing-table">
             <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
-              <tr><th className="px-4 py-3 text-left">Técnico</th><th className="px-4 py-3 text-right">OS</th><th className="px-4 py-3 text-right">Gerado</th><th className="px-4 py-3 text-right">Recebido</th><th className="px-4 py-3 text-right">Serviço recebido</th><th className="px-4 py-3 text-right">Comissão</th><th className="px-4 py-3 text-right">Repassado</th><th className="px-4 py-3 text-right">A repassar</th>{isAdmin && <th />}</tr>
+              <tr><th className="px-4 py-3 text-left">Técnico</th><th className="px-4 py-3 text-right">OS (roteiros)</th><th className="px-4 py-3 text-right">Gerado</th><th className="px-4 py-3 text-right">Recebido</th><th className="px-4 py-3 text-right">Serviço recebido</th><th className="px-4 py-3 text-right">Comissão</th><th className="px-4 py-3 text-right">Repassado</th><th className="px-4 py-3 text-right">A repassar</th>{isAdmin && <th />}</tr>
             </thead>
             <tbody>
               {rows.map((r) => (
                 <tr key={r.technician_id} className="border-t border-slate-100" data-testid={`tech-row-${r.technician_id}`}>
                   <td className="px-4 py-3 font-medium">{r.name}<div className="text-xs text-slate-500">{r.commission_pct}% do serviço</div></td>
-                  <td className="px-4 py-3 text-right">{r.os_count}</td>
+                  <td className="px-4 py-3 text-right">
+                    <button onClick={() => setOsRow(r)} className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:underline" title="Ver OSs atendidas nos roteiros" data-testid={`tech-os-count-${r.technician_id}`}>
+                      <ListChecks size={14} />{r.os_routed}
+                    </button>
+                    <div className="text-[11px] text-slate-500">{r.os_routed_done} concluídas</div>
+                  </td>
                   <td className="px-4 py-3 text-right font-mono-num">{brl(r.gerado)}</td>
                   <td className="px-4 py-3 text-right font-mono-num">{brl(r.recebido)}</td>
                   <td className="px-4 py-3 text-right font-mono-num">{brl(r.servico_pago)}</td>
@@ -117,6 +167,7 @@ export default function Technicians() {
       </Card>
       {isAdmin && <TechSettings />}
       <PayoutDialog row={payRow} period={period} onClose={() => setPayRow(null)} onSaved={load} />
+      <RoutedOsDialog row={osRow} period={period} onClose={() => setOsRow(null)} />
     </>
   );
 }
