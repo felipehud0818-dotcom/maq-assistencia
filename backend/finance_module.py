@@ -259,6 +259,14 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
 _fee_sync = {"at": 0.0, "running": False}
 
 
+async def mark_fee_receipt(num: str, paid_at: str, method: str, receipt_url: str):
+    """Ajusta a entrada da taxa paga com a data/forma do comprovante e o link dele."""
+    tx = await M.fin_transactions.find_one({"os_ids": num, "source": "os", "os_key": "taxa"}, NO_ID)
+    if tx and not tx.get("reconciled"):
+        await M.fin_transactions.update_one({"id": tx["id"]}, {"$set": {
+            "status": "pago", "date": paid_at, "payment_method": method, "receipt_url": receipt_url or tx.get("receipt_url")}})
+
+
 async def _sync_fee_entries():
     try:
         techs = await technicians()

@@ -1,5 +1,6 @@
 """Mi agent: memória persistente, ações (roteiros/OSs), PDFs, anexos e regiões de Sabará."""
 import io
+import os
 import re
 import json
 import uuid
@@ -92,6 +93,11 @@ ACTIONS_PROMPT = (
     '- {"type":"send_whatsapp","os_number":"... (ou \"phone\":\"31999999999\")","text":"mensagem"} → envia WhatsApp pelo número oficial '
     "da Mastermaq (o cliente precisa ter falado com a empresa nas últimas 24h, senão a Meta recusa).\n"
     '- {"type":"delete_os","os_number":"..."} → exclui a OS definitivamente.\n'
+    '- {"type":"register_fee_payment","os_number":"...","amount":150.0,"paid_at":"AAAA-MM-DD","method":"pix|dinheiro|debito|credito",'
+    '"payer":"nome de quem pagou","transaction_id":"..."} → registra a TAXA DE VISITA como PAGA a partir do comprovante enviado '
+    "(preenche Taxa de Visita, marca paga, anexa o comprovante e lança a entrada recebida no Financeiro). Use os dados da seção "
+    "'Comprovantes lidos'. Se o comprovante não deixar claro qual é a OS, procure pelo nome do pagador nas OSs; se ainda houver dúvida, "
+    "pergunte o número da OS antes. Avise se o valor do comprovante for diferente da taxa já cadastrada na OS.\n"
     '- {"type":"sync_orders"} → puxa as ordens do Telecontrol (Hisense e HQ ao mesmo tempo, do último mês até hoje).\n'
     '- {"type":"generate_laudo","os_number":"...","technical_diagnosis":"...","installation_correct":"SIM|NÃO","required_parts":"...",'
     '"technical_notes":"...","final_status":"..."} → gera o laudo com as fotos enviadas na conversa (na ordem FOTO 1..8; '
@@ -102,14 +108,15 @@ ACTIONS_PROMPT = (
     "→ calcula NA HORA a rota real (Google, com trânsito): ordem otimizada, km e minutos por trecho e total, link do Maps. "
     "Não grava nada. Use sempre que pedirem para calcular/simular rota ou roteiro; nunca invente distâncias.\n"
     '- {"type":"generate_pdf","title":"...","content":"texto completo do documento"} → gera PDF novo do zero e devolve link.\n'
-    "Ações create_route/update_route/update_os/create_os/send_whatsapp/delete_os/sync_orders/generate_laudo ficam aguardando o usuário clicar em Confirmar; diga isso em uma frase. "
+    "Ações create_route/update_route/update_os/create_os/send_whatsapp/delete_os/sync_orders/generate_laudo/register_fee_payment ficam aguardando o usuário clicar em Confirmar; diga isso em uma frase. "
     "Nunca escreva o JSON fora do bloco <acoes>."
 )
 OS_EDITABLE = {"status", "technician", "observations", "attendance_date", "priority", "reported_defect", "technical_diagnosis",
                "required_parts", "customer_name", "phone1", "address", "number", "neighborhood", "city", "model",
                "serial_number", "product", "service_type", "visit_fee", "visit_fee_paid", "installation_correct",
                "voltage_f1f2", "voltage_f1_terra", "voltage_f2_terra", "batch"}
-CONFIRM_TYPES = {"create_route", "update_route", "update_os", "create_os", "send_whatsapp", "delete_os", "sync_orders", "generate_laudo"}
+CONFIRM_TYPES = {"create_route", "update_route", "update_os", "create_os", "send_whatsapp", "delete_os", "sync_orders", "generate_laudo",
+                 "register_fee_payment"}
 CREATE_OS = None  # injetado pelo server.py (cria OS reutilizando o endpoint)
 SYNC_ORDERS = None  # injetado pelo server.py (sync Hisense + HQ)
 BASE = (-19.8881334, -43.9420748)
@@ -147,6 +154,10 @@ def summarize(a: dict) -> str:
     if t == "generate_laudo":
         n = len(a.get("photos") or [])
         return f"Gerar laudo da OS {a.get('os_number')} com {n} foto(s) enviada(s) — diagnóstico: {(a.get('technical_diagnosis') or '')[:300]}"
+    if t == "register_fee_payment":
+        return (f"Registrar taxa de visita PAGA na OS {a.get('os_number')}: R$ {a.get('amount') or '(valor da OS)'}"
+                f" em {a.get('paid_at') or 'hoje'} via {a.get('method') or 'pix'}" + (f" — pagador {a['payer']}" if a.get("payer") else "")
+                + (" · com comprovante anexado" if a.get("receipt_photo") else ""))
     if t == "send_whatsapp":
         return f"Enviar WhatsApp para {a.get('os_number') and 'OS ' + str(a['os_number']) or a.get('phone')}: \"{a.get('text')}\""
     if t == "create_os":
@@ -165,6 +176,73 @@ async def _route_orders(db, os_numbers):
     return orders
 
 
+def _money(v) -> float:
+    s = str(v).replace("R$", "").strip()
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    return round(float(s), 2)
+
+
+RECEIPT_PROMPT = (
+    "Leia a imagem. Se for comprovante de pagamento (Pix, TED, boleto, maquininha, recibo), responda SOMENTE um JSON: "
+    '{"comprovante":true,"valor":0.0,"data":"AAAA-MM-DD","hora":"HH:MM","pagador":"...","recebedor":"...",'
+    '"banco":"...","tipo":"pix|ted|boleto|cartao|dinheiro|outro","id_transacao":"...","descricao":"..."}. '
+    'Campos que não aparecerem ficam vazios. Se não for comprovante, responda {"comprovante":false}. Nunca invente valores.'
+)
+
+
+async def read_receipts(photo_ids) -> str:
+    """Lê (visão) as fotos desta mensagem e devolve os dados dos comprovantes encontrados."""
+    import base64
+    from manuais_module import get_object
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+    out = []
+    for i, pid in enumerate(list(photo_ids or [])[:3], 1):
+        try:
+            data, _ = await asyncio.to_thread(get_object, f"{FILE_PREFIX}/{pid}.jpg")
+            chat = LlmChat(api_key=os.environ.get("MI_LLM_KEY") or os.environ["EMERGENT_LLM_KEY"], session_id=f"mi-receipt-{pid}",
+                           system_message="Você extrai dados de comprovantes de pagamento brasileiros.").with_model("openai", "gpt-5.4")
+            raw = await chat.send_message(UserMessage(text=RECEIPT_PROMPT, file_contents=[ImageContent(image_base64=base64.b64encode(data).decode())]))
+            m = re.search(r"\{.*\}", raw or "", re.S)
+            info = json.loads(m.group(0)) if m else {}
+            if info.get("comprovante"):
+                out.append(f"- Imagem {i} (photo_id={pid}): " + "; ".join(f"{k}={v}" for k, v in info.items() if v not in (None, "", True)))
+        except Exception as e:
+            logger.warning(f"[Mi] leitura de comprovante falhou ({pid}): {e!r}")
+    return "\n".join(out)
+
+
+async def _register_fee_payment(db, a: dict) -> str:
+    import finance_module
+    num = str(a.get("os_number") or "").strip()
+    o = await db.service_orders.find_one({"os_number": num}, {"_id": 0})
+    if not o:
+        raise ValueError(f"OS {num} não encontrada")
+    try:
+        amount = _money(a.get("amount")) if a.get("amount") not in (None, "") else _money(o.get("visit_fee") or 0)
+    except ValueError:
+        raise ValueError(f"Valor inválido: {a.get('amount')}")
+    if amount <= 0:
+        raise ValueError("Valor da taxa não informado")
+    paid_at = str(a.get("paid_at") or "")[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", paid_at):
+        paid_at = datetime.now(timezone.utc).date().isoformat()
+    method = a.get("method") if a.get("method") in ("pix", "dinheiro", "debito", "credito") else "pix"
+    pid = a.get("receipt_photo")
+    receipt = f"/api/mi/files/{pid}.jpg" if pid else ""
+    note = (f"[Mi] Taxa de visita PAGA — R$ {amount:.2f} em {datetime.strptime(paid_at, '%Y-%m-%d').strftime('%d/%m/%Y')} via {method}"
+            + (f" ({a['payer']})" if a.get("payer") else "") + (f" · ID {a['transaction_id']}" if a.get("transaction_id") else "")
+            + (f" · Comprovante: {receipt}" if receipt else ""))
+    obs = f"{o['observations']}\n{note}" if o.get("observations") else note
+    now = datetime.now(timezone.utc).isoformat()
+    await db.service_orders.update_one({"os_number": num}, {"$set": {"visit_fee": amount, "visit_fee_paid": True, "observations": obs, "updated_at": now}})
+    await finance_module.on_os_updated({**o, "visit_fee": amount, "visit_fee_paid": True, "updated_at": now})
+    await finance_module.mark_fee_receipt(num, paid_at, method, receipt)
+    old = float(o.get("visit_fee") or 0)
+    diff = f" (a taxa cadastrada era R$ {old:.2f})" if old and abs(old - amount) > 0.009 else ""
+    return f"Taxa da OS {num} registrada como PAGA: R$ {amount:.2f} em {paid_at}{diff}. Entrada lançada no Financeiro."
+
+
 async def execute(db, a: dict, payload: dict = None):
     """Executa ação confirmada. Retorna texto de resultado."""
     from routes_module import create_route, update_route, RouteCreate, RouteUpdate
@@ -179,6 +257,8 @@ async def execute(db, a: dict, payload: dict = None):
         return await SYNC_ORDERS()
     if t == "generate_laudo":
         return await _generate_laudo(db, a)
+    if t == "register_fee_payment":
+        return await _register_fee_payment(db, a)
     if t == "send_whatsapp":
         from whatsapp_module import send_text
         phone = a.get("phone")
@@ -216,8 +296,7 @@ async def execute(db, a: dict, payload: dict = None):
             raise ValueError("Nenhum campo permitido para alterar")
         if "visit_fee" in fields:
             try:
-                fields["visit_fee"] = round(float(str(fields["visit_fee"]).replace("R$", "").replace(".", "").replace(",", ".")
-                                                if "," in str(fields["visit_fee"]) else str(fields["visit_fee"]).replace("R$", "")), 2)
+                fields["visit_fee"] = _money(fields["visit_fee"])
             except ValueError:
                 raise ValueError(f"Taxa de visita inválida: {fields['visit_fee']}")
         if "visit_fee_paid" in fields:

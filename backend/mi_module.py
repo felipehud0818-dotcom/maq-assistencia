@@ -414,6 +414,7 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
             attach = prev and (prev["attachment_name"], prev["attachment_text"])
             file_id = prev and prev.get("attachment_file_id")
         memories = await mi_agent.get_memories(mongo_db, email)
+        receipts_txt = await mi_agent.read_receipts(body.photo_ids) if body.photo_ids else ""
 
         await _load_os(db)
         hist_q = " ".join(m["content"] for m in history if m["role"] == "user")[-400:]
@@ -453,6 +454,7 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
             f"## Manuais disponíveis\n" + "\n".join(f"- {t}" for t in titles) + "\n\n"
             f"## Trechos de manuais relevantes\n{man_txt}\n\n"
             + (f"## Fotos enviadas nesta conversa: {len(conv_photos)} (serão FOTO 1..{len(conv_photos)} do laudo)\n\n" if conv_photos else "")
+            + (f"## Comprovantes lidos nas imagens desta mensagem\n{receipts_txt}\n\n" if receipts_txt else "")
             + f"## Conversa anterior\n{hist_txt or '(início)'}\n\n"
             f"## Pergunta\n{text}"
         )
@@ -507,6 +509,8 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
             elif a["type"] in mi_agent.CONFIRM_TYPES:
                 if a["type"] == "generate_laudo" and not a.get("photos"):
                     a["photos"] = conv_photos
+                if a["type"] == "register_fee_payment" and not a.get("receipt_photo") and body.photo_ids:
+                    a["receipt_photo"] = body.photo_ids[0]
                 await mongo_db["mi_actions"].insert_one({"id": aid, "user_email": email, "conversation_id": cid, "action": a,
                                                          "status": "pending", "created_at": now})
                 actions.append({"id": aid, "type": a["type"], "summary": mi_agent.summarize(a), "status": "pending"})
