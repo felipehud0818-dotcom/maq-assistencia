@@ -160,7 +160,15 @@ export default function Technicians() {
         {payouts.length === 0 ? <Empty text="Nenhum repasse registrado" /> : (
           <div className="divide-y divide-slate-100 text-sm">
             {payouts.map((p) => (
-              <div key={p.id} className="flex justify-between py-2"><span>{fmtDate(p.paid_at)} · {p.technician_name} · período {fmtDate(p.period_start)} a {fmtDate(p.period_end)}</span><span className="font-mono-num font-semibold">{brl(p.amount)}</span></div>
+              <div key={p.id} className={`flex items-center justify-between gap-2 py-2 ${p.reversed ? "opacity-50 line-through" : ""}`} data-testid={`payout-row-${p.id}`}>
+                <span>{fmtDate(p.paid_at)} · {p.technician_name} · período {fmtDate(p.period_start)} a {fmtDate(p.period_end)}{p.reversed ? " · estornado" : ""}</span>
+                <span className="flex items-center gap-3">
+                  <span className="font-mono-num font-semibold">{brl(p.amount)}</span>
+                  {isAdmin && !p.reversed && <button className="text-xs text-rose-700 hover:underline no-underline" data-testid={`payout-reverse-${p.id}`}
+                    onClick={async () => { if (!window.confirm("Estornar este repasse? A saída correspondente será removida e o valor volta para 'a repassar'.")) return;
+                      try { await api.post(`/finance/payouts/${p.id}/reverse`); toast.success("Repasse estornado"); load(); } catch (e) { toast.error(errMsg(e)); } }}>Estornar</button>}
+                </span>
+              </div>
             ))}
           </div>
         )}

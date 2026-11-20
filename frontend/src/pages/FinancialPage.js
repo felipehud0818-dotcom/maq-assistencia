@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, ArrowDownToLine, ArrowUpFromLine, Tags, Repeat, Target, Users, Landmark, Bot, Lock, Loader2 } from 'lucide-react';
+import { LayoutDashboard, ArrowDownToLine, ArrowUpFromLine, Tags, Repeat, Target, Users, Landmark, Bot, Lock, Loader2, FileBarChart, ShieldCheck } from 'lucide-react';
 import DashboardLayout from '../components/DashboardLayout';
 import { api, errMsg, getUnlock, setUnlock, clearUnlock } from '../components/finance/api';
 import { Input } from '../components/ui/input';
@@ -14,17 +14,21 @@ import Budgets from '../components/finance/Budgets';
 import Technicians from '../components/finance/Technicians';
 import Banks from '../components/finance/Banks';
 import Assistants from '../components/finance/Assistants';
+import Reports from '../components/finance/Reports';
+import Control from '../components/finance/Control';
 
 const TABS = [
   { id: 'visao-geral', label: 'Visão Geral', Icon: LayoutDashboard, tech: true, el: () => <Overview /> },
   { id: 'entradas', label: 'Entradas', Icon: ArrowDownToLine, tech: true, el: () => <Transactions type="entrada" /> },
   { id: 'saidas', label: 'Saídas', Icon: ArrowUpFromLine, tech: true, el: () => <Transactions type="saida" /> },
+  { id: 'dre', label: 'DRE e Rentabilidade', Icon: FileBarChart, el: () => <Reports /> },
   { id: 'categorias', label: 'Categorias', Icon: Tags, el: () => <Categories /> },
   { id: 'despesas-fixas', label: 'Despesas Fixas', Icon: Repeat, el: () => <Recurring /> },
   { id: 'metas-limites', label: 'Metas e Limites', Icon: Target, el: () => <Budgets /> },
   { id: 'tecnicos', label: 'Técnicos', Icon: Users, tech: true, el: () => <Technicians /> },
   { id: 'bancos', label: 'Bancos', Icon: Landmark, el: () => <Banks /> },
   { id: 'assistentes', label: 'Assistentes', Icon: Bot, el: () => <Assistants /> },
+  { id: 'controle', label: 'Controle', Icon: ShieldCheck, el: () => <Control /> },
 ];
 
 function Blocked() {
@@ -74,9 +78,16 @@ export default function FinancialPage() {
   const [me, setMe] = useState(null);
   const [unlocked, setUnlocked] = useState(() => !!getUnlock());
 
-  useEffect(() => {
-    api.get('/finance/me').then((r) => setMe(r.data)).catch(() => setMe({ has_finance: false }));
-  }, []);
+  const [meErr, setMeErr] = useState('');
+  const loadMe = () => {
+    setMeErr('');
+    api.get('/finance/me').then((r) => setMe(r.data)).catch((e) => {
+      // Só "sem acesso" quando o servidor disser isso; falha de rede vira erro com nova tentativa.
+      if (e?.response?.status === 403) setMe({ has_finance: false }); else setMeErr(errMsg(e));
+    });
+  };
+
+  useEffect(loadMe, []);
 
   useEffect(() => {
     const relock = () => setUnlocked(false);
@@ -90,6 +101,7 @@ export default function FinancialPage() {
     };
   }, []);
 
+  if (meErr) return <DashboardLayout><div className="max-w-md mx-auto mt-20 p-6 text-center border border-slate-200 rounded-xl bg-white space-y-3" data-testid="finance-load-error"><p className="text-sm text-rose-700">Não foi possível carregar o Financeiro: {meErr}</p><Button onClick={loadMe} data-testid="finance-retry-btn">Tentar de novo</Button></div></DashboardLayout>;
   if (!me) return <DashboardLayout><div className="py-20 text-center text-slate-500"><Loader2 className="h-5 w-5 animate-spin inline mr-2" />Carregando…</div></DashboardLayout>;
   if (!me.has_finance) return <DashboardLayout><Blocked /></DashboardLayout>;
   if (!unlocked) return <DashboardLayout><LockScreen onUnlocked={() => setUnlocked(true)} /></DashboardLayout>;

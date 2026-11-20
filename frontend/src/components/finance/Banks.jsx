@@ -165,7 +165,13 @@ export default function Banks() {
             <tbody>
               {txs.map((bt) => (
                 <BankRow key={bt.id} bt={bt}
-                  onLink={(b, s) => run(() => api.post(`/banks/transactions/${b.id}/link`, { transaction_id: s.transaction_id }), "Vinculado e conferido")}
+                  onLink={(b, s) => run(async () => {
+                    try { await api.post(`/banks/transactions/${b.id}/link`, { transaction_id: s.transaction_id }); }
+                    catch (e) {
+                      if (e?.response?.status !== 422 || !window.confirm(`${errMsg(e)}.\nConciliar mesmo assim? A diferença fica registrada na auditoria.`)) throw e;
+                      await api.post(`/banks/transactions/${b.id}/link`, { transaction_id: s.transaction_id, allow_diff: true });
+                    }
+                  }, "Vinculado e conferido")}
                   onCreate={(b, s) => setCreateState({ bt: b, osId: s?.os_id, osLabel: s?.label })}
                   onIgnore={(b) => run(() => api.post(`/banks/transactions/${b.id}/ignore`))} />
               ))}

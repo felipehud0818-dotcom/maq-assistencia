@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger("finance")
 router = APIRouter()
@@ -236,13 +237,16 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
             return
         existing = await M.fin_transactions.find_one({"os_ids": num, "source": "os", "os_key": "taxa"}, NO_ID)
         cancelled = "cancel" in str(order.get("status") or "").lower()
-        if fee <= 0 or cancelled:
+        reg = iso_date(order.get("registration_date") or order.get("created_at"))
+        since = (await get_settings()).get("fee_since")
+        # Taxa não paga de OS anterior à data de corte não entra como a receber.
+        before_cut = bool(since and reg and reg < since and not order.get("visit_fee_paid"))
+        if fee <= 0 or cancelled or before_cut:
             if existing and existing.get("auto") and not existing.get("reconciled") and existing["status"] != "pago":
                 await M.fin_transactions.delete_one({"id": existing["id"]})
             return
         status = "pago" if order.get("visit_fee_paid") else "previsto"
         # Paga: entra na data em que foi marcada como paga. A receber: data de cadastro da OS.
-        reg = iso_date(order.get("registration_date") or order.get("created_at"))
         paid_on = iso_date(order.get("updated_at")) or today()
         if existing:
             if existing.get("reconciled") or not existing.get("auto"):
@@ -256,8 +260,7 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
                 await M.fin_transactions.update_one({"id": existing["id"]}, {"$set": {"amount": round(fee, 2), "status": status, "date": when}})
             return
         when = paid_on if status == "pago" else (reg or today())
-        if await M.fin_transactions.find_one({"os_ids": num, "source": "os"}):
-            return
+        # A taxa é um componente independente: lançamentos de serviço/peça da mesma OS não bloqueiam a criação.
         cats = await system_cats()
         tech = match_tech(order.get("technician"), techs if techs is not None else await technicians())
         await M.fin_transactions.insert_one({
@@ -270,6 +273,37 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
 
 
 _fee_sync = {"at": 0.0, "running": False}
+_settings = {"at": 0.0, "data": {}}
+
+
+async def get_settings() -> dict:
+    if time.time() - _settings["at"] > 30:
+        _settings["data"] = await M.fin_settings.find_one({"id": "main"}, NO_ID) or {}
+        _settings["at"] = time.time()
+    return _settings["data"]
+
+
+AUDIT_FIELDS = ("type", "date", "amount", "description", "category_id", "payment_method", "status", "os_ids",
+                "technician_id", "reconciled", "bank_tx_id", "credit_mode", "installments", "period_start", "period_end")
+
+
+def _slim(d: Optional[dict]) -> Optional[dict]:
+    return {k: d.get(k) for k in AUDIT_FIELDS if k in d} if d else None
+
+
+async def audit(user: Optional[dict], entity: str, entity_id: str, action: str, before=None, after=None, reason: str = ""):
+    """Trilha imutável: quem, quando, antes/depois. Nunca é editada pela API."""
+    try:
+        if isinstance(before, list) or isinstance(after, list):
+            b, a = [_slim(x) for x in before or []], [_slim(x) for x in after or []]
+        else:
+            b, a = _slim(before), _slim(after)
+        await M.fin_audit_logs.insert_one({
+            "id": new_id(), "entity": entity, "entity_id": entity_id, "action": action, "before": b, "after": a,
+            "reason": reason, "actor_id": (user or {}).get("id"), "actor_name": (user or {}).get("name") or (user or {}).get("email") or "sistema",
+            "created_at": now_iso()})
+    except Exception as exc:
+        log.error("audit %s %s: %s", entity, entity_id, exc)
 
 
 async def mark_fee_receipt(num: str, paid_at: str, method: str, receipt_url: str):
@@ -360,8 +394,9 @@ async def get_os(os_number: str, user: dict) -> dict:
 
 @router.get("/finance/os")
 async def list_os(q: Optional[str] = None, ids: Optional[str] = None, user: dict = Depends(require_finance)):
-    rows = await os_rows(q=(q or "").strip() or None, ids=[i for i in ids.split("|") if i] if ids is not None else None)
-    return rows if user["role"] == "admin" else [r for r in rows if r["technician_id"] == user["id"]]
+    rows = await os_rows(q=(q or "").strip() or None, ids=[i for i in ids.split("|") if i] if ids is not None else None,
+                         limit=30 if user["role"] == "admin" else 500)
+    return rows if user["role"] == "admin" else [r for r in rows if r["technician_id"] == user["id"]][:30]
 
 
 @router.get("/finance/os/{os_number}/finance")
@@ -382,8 +417,13 @@ async def launch_os(os_number: str, body: LaunchIn, user: dict = Depends(require
     if values_total(vals) <= 0:
         raise HTTPException(400, "Informe ao menos um valor")
     await M.fin_os_values.update_one({"os_number": os_number}, {"$set": vals}, upsert=True)
-    await M.fin_transactions.delete_many({"os_ids": os_number, "source": "os"})
+    # Cria os novos antes de remover os antigos: uma falha no meio nunca deixa a OS sem lançamentos.
+    old = await M.fin_transactions.find({"os_ids": os_number, "source": "os"}, NO_ID).to_list(50)
     n = await os_entries(o, vals, body.payment_method, body.status, vals["date"], credit)
+    if old:
+        await M.fin_transactions.delete_many({"id": {"$in": [t["id"] for t in old]}})
+    new = await M.fin_transactions.find({"os_ids": os_number, "source": "os"}, NO_ID).to_list(50)
+    await audit(user, "os_launch", os_number, "replaced" if old else "created", old, new)
     return {"ok": True, "created": n}
 
 
@@ -542,12 +582,16 @@ async def generate_recurring() -> int:
     async for r in M.fin_recurring.find({"active": True}, NO_ID):
         if await M.fin_transactions.find_one({"recurring_id": r["id"], "date": {"$regex": f"^{ym}"}}):
             continue
-        await M.fin_transactions.insert_one({
-            "id": new_id(), "type": "saida", "date": month_day(t.year, t.month, r["day_of_month"]),
-            "amount": r["amount"], "description": r["description"], "category_id": r["category_id"],
-            "payment_method": r.get("payment_method", "pix"), "status": "previsto", "os_ids": [],
-            "technician_id": None, "part_name": None, "reconciled": False, "source": "recorrente",
-            "recurring_id": r["id"], "created_at": now_iso()})
+        try:
+            # recurring_key único (índice) impede duplicar a competência em execuções simultâneas.
+            await M.fin_transactions.insert_one({
+                "id": new_id(), "type": "saida", "date": month_day(t.year, t.month, r["day_of_month"]),
+                "amount": r["amount"], "description": r["description"], "category_id": r["category_id"],
+                "payment_method": r.get("payment_method", "pix"), "status": "previsto", "os_ids": [],
+                "technician_id": None, "part_name": None, "reconciled": False, "source": "recorrente",
+                "recurring_id": r["id"], "recurring_key": f"{r['id']}:{ym}", "created_at": now_iso()})
+        except DuplicateKeyError:
+            continue
         created += 1
     return created
 
@@ -581,43 +625,66 @@ async def list_transactions(
 
 
 @router.post("/finance/transactions")
-async def create_transaction(body: TxIn, _: dict = Depends(require_admin)):
+async def create_transaction(body: TxIn, user: dict = Depends(require_admin)):
     doc = {"id": new_id(), **(await validate_tx(body)), "reconciled": False, "source": "manual", "recurring_id": None,
            "created_at": now_iso()}
     await M.fin_transactions.insert_one(doc)
     doc.pop("_id", None)
+    await audit(user, "transaction", doc["id"], "created", None, doc)
     return doc
 
 
 @router.put("/finance/transactions/{tx_id}")
-async def update_transaction(tx_id: str, body: TxIn, _: dict = Depends(require_admin)):
-    data = await validate_tx(body)
-    data["auto"] = False
-    if (await M.fin_transactions.update_one({"id": tx_id}, {"$set": data})).matched_count == 0:
+async def update_transaction(tx_id: str, body: TxIn, user: dict = Depends(require_admin)):
+    before = await M.fin_transactions.find_one({"id": tx_id}, NO_ID)
+    if not before:
         raise HTTPException(404, "Lançamento não encontrado")
-    return with_status(await M.fin_transactions.find_one({"id": tx_id}, NO_ID))
+    data = await validate_tx(body)
+    if before.get("reconciled") and (round(data["amount"], 2) != round(before["amount"], 2) or data["type"] != before["type"]):
+        raise HTTPException(409, "Lançamento conferido com o extrato: desfaça a conferência antes de mudar valor ou tipo")
+    data["auto"] = False
+    await M.fin_transactions.update_one({"id": tx_id}, {"$set": data})
+    after = await M.fin_transactions.find_one({"id": tx_id}, NO_ID)
+    await audit(user, "transaction", tx_id, "updated", before, after)
+    return with_status(after)
 
 
 @router.delete("/finance/transactions/{tx_id}")
-async def delete_transaction(tx_id: str, _: dict = Depends(require_admin)):
-    if (await M.fin_transactions.delete_one({"id": tx_id})).deleted_count == 0:
+async def delete_transaction(tx_id: str, user: dict = Depends(require_admin)):
+    before = await M.fin_transactions.find_one({"id": tx_id}, NO_ID)
+    if not before:
         raise HTTPException(404, "Lançamento não encontrado")
-    await M.fin_bank_transactions.update_many({"linked_tx_id": tx_id}, {"$set": {"handled": None, "linked_tx_id": None}})
+    if before.get("reconciled") or before.get("bank_tx_id"):
+        raise HTTPException(409, "Lançamento conferido com o extrato não pode ser excluído. Desfaça a conferência primeiro.")
+    if before.get("source") == "repasse":
+        raise HTTPException(409, "Repasse de comissão: estorne pela aba Técnicos")
+    await M.fin_transactions.delete_one({"id": tx_id})
+    await audit(user, "transaction", tx_id, "deleted", before, None)
     return {"ok": True}
 
 
 @router.put("/finance/transactions/{tx_id}/links")
-async def set_links(tx_id: str, body: LinksIn, _: dict = Depends(require_admin)):
+async def set_links(tx_id: str, body: LinksIn, user: dict = Depends(require_admin)):
     ids = await check_os_ids(body.os_ids)
-    if (await M.fin_transactions.update_one({"id": tx_id}, {"$set": {"os_ids": ids}})).matched_count == 0:
+    before = await M.fin_transactions.find_one({"id": tx_id}, NO_ID)
+    if not before:
         raise HTTPException(404, "Lançamento não encontrado")
+    await M.fin_transactions.update_one({"id": tx_id}, {"$set": {"os_ids": ids}})
+    await audit(user, "transaction", tx_id, "links", before, {**before, "os_ids": ids})
     return {"ok": True, "os_ids": ids}
 
 
 @router.patch("/finance/transactions/{tx_id}/reconcile")
-async def reconcile(tx_id: str, body: ReconcileIn, _: dict = Depends(require_admin)):
-    if (await M.fin_transactions.update_one({"id": tx_id}, {"$set": {"reconciled": body.reconciled}})).matched_count == 0:
+async def reconcile(tx_id: str, body: ReconcileIn, user: dict = Depends(require_admin)):
+    before = await M.fin_transactions.find_one({"id": tx_id}, NO_ID)
+    if not before:
         raise HTTPException(404, "Lançamento não encontrado")
+    upd = {"reconciled": body.reconciled}
+    if not body.reconciled and before.get("bank_tx_id"):
+        upd["bank_tx_id"] = None
+        await M.fin_bank_transactions.update_one({"id": before["bank_tx_id"]}, {"$set": {"handled": None, "linked_tx_id": None}})
+    await M.fin_transactions.update_one({"id": tx_id}, {"$set": upd})
+    await audit(user, "transaction", tx_id, "reconciled" if body.reconciled else "unreconciled", before, {**before, **upd})
     return {"ok": True}
 
 
@@ -803,6 +870,141 @@ def brl_py(v: float) -> str:
     return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+# ---------- Configurações, auditoria, DRE e rentabilidade ----------
+class SettingsIn(BaseModel):
+    fee_since: Optional[str] = None
+
+
+@router.get("/finance/settings")
+async def read_settings(_: dict = Depends(require_admin)):
+    s = await M.fin_settings.find_one({"id": "main"}, NO_ID) or {}
+    return {"fee_since": s.get("fee_since")}
+
+
+@router.put("/finance/settings")
+async def save_settings(body: SettingsIn, user: dict = Depends(require_admin)):
+    since = (body.fee_since or "").strip() or None
+    if since and iso_date(since) != since:
+        raise HTTPException(400, "Data inválida")
+    before = await M.fin_settings.find_one({"id": "main"}, NO_ID) or {}
+    await M.fin_settings.update_one({"id": "main"}, {"$set": {"id": "main", "fee_since": since, "updated_at": now_iso()}}, upsert=True)
+    await M.fin_audit_logs.insert_one({"id": new_id(), "entity": "settings", "entity_id": "main", "action": "updated",
+                                       "before": {"fee_since": before.get("fee_since")}, "after": {"fee_since": since}, "reason": "",
+                                       "actor_id": user.get("id"), "actor_name": user.get("name") or user.get("email"), "created_at": now_iso()})
+    _settings["at"] = 0
+    _fee_sync["at"] = 0
+    sync_fee_entries()  # reaplica a regra das taxas em segundo plano
+    return {"fee_since": since}
+
+
+@router.get("/finance/audit")
+async def list_audit(entity: Optional[str] = None, entity_id: Optional[str] = None, limit: int = Query(300, le=2000),
+                     _: dict = Depends(require_admin)):
+    q = {}
+    if entity:
+        q["entity"] = entity
+    if entity_id:
+        q["entity_id"] = entity_id
+    return await M.fin_audit_logs.find(q, NO_ID).sort("created_at", -1).to_list(limit)
+
+
+async def _dre_block(start: str, end: str, regime: str) -> dict:
+    q = {"date": {"$gte": start, "$lte": end}}
+    if regime == "caixa":
+        q["status"] = "pago"
+    txs = await M.fin_transactions.find(q, NO_ID).to_list(100000)
+    cats = {c["id"]: c async for c in M.fin_categories.find({}, NO_ID)}
+    groups, detail = {}, {}
+    for t in txs:
+        c = cats.get(t.get("category_id"), {"group": "outros" if t["type"] == "entrada" else "outra", "name": "Sem categoria"})
+        g = f"{t['type']}:{c['group']}"
+        groups[g] = groups.get(g, 0) + t["amount"]
+        detail.setdefault(g, {}).setdefault(c["name"], 0)
+        detail[g][c["name"]] += t["amount"]
+    gv = lambda k: round(groups.get(k, 0), 2)  # noqa: E731
+    receita = round(sum(gv(f"entrada:{g}") for g in GROUPS["entrada"]), 2)
+    custos = gv("saida:variavel")
+    lucro_bruto = round(receita - custos, 2)
+    fixas, outras = gv("saida:fixa"), gv("saida:outra")
+    resultado = round(lucro_bruto - fixas - outras, 2)
+    pct = lambda v: round(v / receita * 100, 1) if receita else None  # noqa: E731
+    det = lambda k: [{"name": n, "total": round(v, 2)} for n, v in sorted(detail.get(k, {}).items(), key=lambda x: -x[1])]  # noqa: E731
+    lines = [
+        {"key": "receita", "label": "Receita bruta", "value": receita, "pct": pct(receita), "level": 0,
+         "children": [{"name": {"servico": "Serviços", "peca": "Peças", "taxa": "Taxas de visita", "outros": "Outras receitas"}[g],
+                       "total": gv(f"entrada:{g}")} for g in GROUPS["entrada"]]},
+        {"key": "custos", "label": "(−) Custos variáveis / diretos", "value": -custos, "pct": pct(custos), "level": 1, "children": det("saida:variavel")},
+        {"key": "lucro_bruto", "label": "= Margem de contribuição", "value": lucro_bruto, "pct": pct(lucro_bruto), "level": 0, "strong": True},
+        {"key": "fixas", "label": "(−) Despesas fixas", "value": -fixas, "pct": pct(fixas), "level": 1, "children": det("saida:fixa")},
+        {"key": "outras", "label": "(−) Outras despesas", "value": -outras, "pct": pct(outras), "level": 1, "children": det("saida:outra")},
+        {"key": "resultado", "label": "= Resultado operacional", "value": resultado, "pct": pct(resultado), "level": 0, "strong": True},
+    ]
+    return {"lines": lines, "receita": receita, "resultado": resultado, "count": len(txs)}
+
+
+@router.get("/finance/dre")
+async def dre(start: str, end: str, regime: str = "caixa", _: dict = Depends(require_admin)):
+    """DRE gerencial (não substitui a demonstração contábil oficial). Caixa = só pago; competência = tudo pela data."""
+    if regime not in ("caixa", "competencia"):
+        raise HTTPException(400, "Regime inválido")
+    s, e = parse_date(start), parse_date(end)
+    days = (e - s).days + 1
+    ps, pe = (s - timedelta(days=days)).isoformat(), (s - timedelta(days=1)).isoformat()
+    cur, prev = await _dre_block(start, end, regime), await _dre_block(ps, pe, regime)
+    pmap = {ln["key"]: ln["value"] for ln in prev["lines"]}
+    for ln in cur["lines"]:
+        ln["previous"] = pmap.get(ln["key"], 0)
+    return {**cur, "previous_range": {"start": ps, "end": pe}, "regime": regime}
+
+
+@router.get("/finance/profitability")
+async def profitability(start: str, end: str, _: dict = Depends(require_admin)):
+    """Rentabilidade por OS e por técnico: receita − custos ligados à OS − comissão estimada."""
+    txs = await M.fin_transactions.find({"date": {"$gte": start, "$lte": end}, "os_ids.0": {"$exists": True},
+                                         "source": {"$ne": "repasse"}}, NO_ID).to_list(100000)
+    techs = {t["id"]: t for t in await technicians()}
+    service_cats = {c["id"] async for c in M.fin_categories.find({"type": "entrada", "group": "servico"}, {"_id": 0, "id": 1})}
+    by_os = {}
+    for t in txs:
+        share = t["amount"] / len(t["os_ids"])
+        for num in t["os_ids"]:
+            r = by_os.setdefault(num, {"os_number": str(num).strip(), "receita": 0.0, "servico": 0.0, "custos": 0.0,
+                                       "recebido": 0.0, "technician_id": None})
+            if t["type"] == "entrada":
+                r["receita"] += share
+                r["recebido"] += share if t.get("status") == "pago" else 0
+                r["servico"] += share if t.get("category_id") in service_cats else 0
+                r["technician_id"] = r["technician_id"] or t.get("technician_id")
+            else:
+                r["custos"] += share
+    rows, by_tech = [], {}
+    for r in by_os.values():
+        tech = techs.get(r["technician_id"]) or {}
+        com = r["servico"] * (tech.get("commission_pct") or 0) / 100
+        margem = r["receita"] - r["custos"] - com
+        row = {**{k: round(v, 2) if isinstance(v, float) else v for k, v in r.items()}, "comissao": round(com, 2),
+               "margem": round(margem, 2), "margem_pct": round(margem / r["receita"] * 100, 1) if r["receita"] else None,
+               "technician": tech.get("name") or ""}
+        rows.append(row)
+        bt = by_tech.setdefault(r["technician_id"] or "-", {"technician": tech.get("name") or "Sem técnico", "os": 0,
+                                                             "receita": 0.0, "margem": 0.0})
+        bt["os"] += 1
+        bt["receita"] += r["receita"]
+        bt["margem"] += margem
+    rows.sort(key=lambda x: x["margem"])
+    receita = sum(r["receita"] for r in rows)
+    margem = sum(r["margem"] for r in rows)
+    techs_out = sorted(({**v, "receita": round(v["receita"], 2), "margem": round(v["margem"], 2),
+                         "ticket": round(v["receita"] / v["os"], 2) if v["os"] else 0,
+                         "margem_pct": round(v["margem"] / v["receita"] * 100, 1) if v["receita"] else None}
+                        for v in by_tech.values()), key=lambda x: -x["margem"])
+    return {"summary": {"os": len(rows), "receita": round(receita, 2), "margem": round(margem, 2),
+                        "ticket": round(receita / len(rows), 2) if rows else 0,
+                        "margem_pct": round(margem / receita * 100, 1) if receita else None,
+                        "deficitarias": sum(1 for r in rows if r["margem"] < 0)},
+            "os": rows[:500], "technicians": techs_out}
+
+
 # ---------- Despesas fixas ----------
 class RecurringIn(BaseModel):
     description: str
@@ -961,8 +1163,9 @@ async def technicians_closing(start: str, end: str, user: dict = Depends(require
         txs = [with_status(t) for t in txs]
         servico_pago = sum(t["amount"] for t in txs if t["status"] == "pago" and t["category_id"] in service_cats)
         commission = servico_pago * (tech.get("commission_pct") or 0) / 100
-        payouts = await M.fin_payouts.find({"technician_id": tech["id"], "period_start": {"$lte": end},
-                                            "period_end": {"$gte": start}}, NO_ID).to_list(500)
+        # Repasse conta só no fechamento cujo período o contém inteiro (nunca em dois fechamentos).
+        payouts = await M.fin_payouts.find({"technician_id": tech["id"], "period_start": {"$gte": start},
+                                            "period_end": {"$lte": end}, "reversed": {"$ne": True}}, NO_ID).to_list(500)
         repassado = sum(p["amount"] for p in payouts)
         out.append({"technician_id": tech["id"], "name": tech["name"], "commission_pct": tech.get("commission_pct", 0),
                     "finance_access": tech.get("finance_access"), "os_count": len({o for t in txs for o in t.get("os_ids", [])}),
@@ -996,25 +1199,63 @@ async def list_payouts(technician_id: Optional[str] = None, user: dict = Depends
     return await M.fin_payouts.find(q, NO_ID).sort("paid_at", -1).to_list(500)
 
 
+@router.post("/finance/payouts/{pid}/reverse")
+async def reverse_payout(pid: str, user: dict = Depends(require_admin)):
+    p = await M.fin_payouts.find_one({"id": pid, "reversed": {"$ne": True}}, NO_ID)
+    if not p:
+        raise HTTPException(404, "Repasse não encontrado ou já estornado")
+    tx = await M.fin_transactions.find_one({"id": p.get("transaction_id")}, NO_ID)
+    if tx and tx.get("reconciled"):
+        raise HTTPException(409, "A saída do repasse já foi conferida com o extrato")
+    await M.fin_payouts.update_one({"id": pid}, {"$set": {"reversed": True, "reversed_at": now_iso()}})
+    if tx:
+        await M.fin_transactions.delete_one({"id": tx["id"]})
+    await audit(user, "payout", pid, "reversed", {**p, **(tx or {})}, None)
+    return {"ok": True}
+
+
 @router.post("/finance/payouts")
-async def create_payout(body: PayoutIn, _: dict = Depends(require_admin)):
+async def create_payout(body: PayoutIn, user: dict = Depends(require_admin)):
     if body.payment_method not in METHODS:
         raise HTTPException(400, "Forma de pagamento inválida")
+    if body.period_start > body.period_end:
+        raise HTTPException(400, "Período inválido")
     tech = next((t for t in await technicians() if t["id"] == body.technician_id), None)
     if not tech:
         raise HTTPException(404, "Técnico não encontrado")
+    overlap = await M.fin_payouts.find_one({"technician_id": tech["id"], "reversed": {"$ne": True},
+                                            "period_start": {"$lte": body.period_end}, "period_end": {"$gte": body.period_start},
+                                            "$nor": [{"period_start": body.period_start, "period_end": body.period_end}]}, NO_ID)
+    if overlap:
+        raise HTTPException(409, f"Já existe repasse no período {fmt_br(overlap['period_start'])} a {fmt_br(overlap['period_end'])}, "
+                                 "que se sobrepõe a este. Use o mesmo período ou um período sem sobreposição.")
+    row = next((r for r in await technicians_closing(body.period_start, body.period_end, user) if r["technician_id"] == tech["id"]), None)
+    devido = row["a_repassar"] if row else 0
+    if body.amount > devido + 0.009:
+        raise HTTPException(400, f"Valor acima do saldo a repassar no período ({brl_py(devido)})")
     cats = await system_cats()
-    tx_id = new_id()
-    await M.fin_transactions.insert_one({
+    tx_id, pid = new_id(), new_id()
+    tx = {
         "id": tx_id, "type": "saida", "date": today(), "amount": body.amount,
-        "description": f"Repasse de comissão - {tech['name']} ({body.period_start} a {body.period_end})",
+        "description": f"Repasse de comissão - {tech['name']} ({fmt_br(body.period_start)} a {fmt_br(body.period_end)})",
         "category_id": cats.get("comissao"), "payment_method": body.payment_method, "status": "pago", "os_ids": [],
-        "technician_id": tech["id"], "part_name": None, "reconciled": False, "source": "repasse",
-        "recurring_id": None, "created_at": now_iso()})
-    doc = {"id": new_id(), **body.model_dump(), "technician_name": tech["name"], "transaction_id": tx_id, "paid_at": today()}
-    await M.fin_payouts.insert_one(doc)
+        "technician_id": tech["id"], "part_name": None, "reconciled": False, "source": "repasse", "payout_id": pid,
+        "recurring_id": None, "created_at": now_iso()}
+    doc = {"id": pid, **body.model_dump(), "technician_name": tech["name"], "transaction_id": tx_id, "paid_at": today(),
+           "commission_snapshot": row, "created_by": user.get("id")}
+    await M.fin_transactions.insert_one(tx)
+    try:
+        await M.fin_payouts.insert_one(doc)
+    except Exception:
+        await M.fin_transactions.delete_one({"id": tx_id})
+        raise
     doc.pop("_id", None)
+    await audit(user, "payout", pid, "created", None, {**doc, "amount": body.amount})
     return doc
+
+
+def fmt_br(iso: str) -> str:
+    return f"{iso[8:10]}/{iso[5:7]}/{iso[:4]}" if iso and len(iso) >= 10 else iso
 
 
 # ---------- Bancos (Pluggy) ----------
@@ -1052,6 +1293,7 @@ class ItemIn(BaseModel):
 
 class LinkBankIn(BaseModel):
     transaction_id: str
+    allow_diff: bool = False
 
 
 class CreateFromBankIn(BaseModel):
@@ -1169,19 +1411,34 @@ async def get_bank_tx(bid: str) -> dict:
 
 
 @router.post("/banks/transactions/{bid}/link")
-async def link_bank(bid: str, body: LinkBankIn, _: dict = Depends(require_admin)):
-    await get_bank_tx(bid)
-    res = await M.fin_transactions.update_one({"id": body.transaction_id},
-                                              {"$set": {"bank_tx_id": bid, "reconciled": True, "status": "pago"}})
-    if res.matched_count == 0:
+async def link_bank(bid: str, body: LinkBankIn, user: dict = Depends(require_admin)):
+    bt = await get_bank_tx(bid)
+    tx = await M.fin_transactions.find_one({"id": body.transaction_id}, NO_ID)
+    if not tx:
         raise HTTPException(404, "Lançamento não encontrado")
-    await M.fin_bank_transactions.update_one({"id": bid}, {"$set": {"handled": "vinculado", "linked_tx_id": body.transaction_id}})
+    if tx["type"] != bt["type"]:
+        raise HTTPException(400, "Tipo diferente: o movimento só concilia com lançamento do mesmo tipo (entrada/saída)")
+    if tx.get("bank_tx_id") and tx["bank_tx_id"] != bid:
+        raise HTTPException(409, "Este lançamento já está conciliado com outro movimento bancário")
+    diff = round(abs(float(tx["amount"]) - float(bt["amount"])), 2)
+    if diff > 0.01 and not body.allow_diff:
+        raise HTTPException(422, f"Valores diferentes: extrato {brl_py(bt['amount'])} x lançamento {brl_py(tx['amount'])}")
+    # Trava otimista: só concilia se o movimento ainda estiver pendente.
+    res = await M.fin_bank_transactions.update_one({"id": bid, "handled": None},
+                                                   {"$set": {"handled": "vinculado", "linked_tx_id": tx["id"], "linked_by": user.get("id"), "linked_at": now_iso()}})
+    if res.matched_count == 0:
+        raise HTTPException(409, "Movimento bancário já foi tratado")
+    await M.fin_transactions.update_one({"id": tx["id"]}, {"$set": {"bank_tx_id": bid, "reconciled": True, "status": "pago", "bank_diff": diff or None}})
+    await audit(user, "reconciliation", bid, "linked", tx, {**tx, "bank_tx_id": bid, "reconciled": True, "status": "pago"},
+                reason=f"diferença {brl_py(diff)}" if diff > 0.01 else "")
     return {"ok": True}
 
 
 @router.post("/banks/transactions/{bid}/create")
-async def create_from_bank(bid: str, body: CreateFromBankIn, _: dict = Depends(require_admin)):
+async def create_from_bank(bid: str, body: CreateFromBankIn, user: dict = Depends(require_admin)):
     bt = await get_bank_tx(bid)
+    if bt.get("handled"):
+        raise HTTPException(409, "Movimento bancário já foi tratado")
     cat = await M.fin_categories.find_one({"id": body.category_id}, NO_ID)
     if not cat or cat["type"] != bt["type"]:
         raise HTTPException(400, "Categoria inválida para este movimento")
@@ -1195,13 +1452,16 @@ async def create_from_bank(bid: str, body: CreateFromBankIn, _: dict = Depends(r
         "part_name": None, "reconciled": True, "source": "banco", "recurring_id": None, "bank_tx_id": bid,
         "created_at": now_iso()})
     await M.fin_bank_transactions.update_one({"id": bid}, {"$set": {"handled": "criado", "linked_tx_id": tx_id}})
+    await audit(user, "reconciliation", bid, "created_tx", None, {"type": bt["type"], "amount": bt["amount"], "date": bt["date"], "bank_tx_id": bid})
     return {"ok": True, "transaction_id": tx_id}
 
 
 @router.post("/banks/transactions/{bid}/ignore")
-async def ignore_bank(bid: str, _: dict = Depends(require_admin)):
+async def ignore_bank(bid: str, user: dict = Depends(require_admin)):
     await get_bank_tx(bid)
-    await M.fin_bank_transactions.update_one({"id": bid}, {"$set": {"handled": "ignorado"}})
+    if (await M.fin_bank_transactions.update_one({"id": bid, "handled": None}, {"$set": {"handled": "ignorado"}})).matched_count == 0:
+        raise HTTPException(409, "Movimento bancário já foi tratado")
+    await audit(user, "reconciliation", bid, "ignored")
     return {"ok": True}
 
 
@@ -1462,6 +1722,12 @@ async def startup():
                 await M[col].create_index(k, unique=k in ("id", "os_number"))
             except Exception as exc:
                 log.error("index %s.%s: %s", col, k, exc)
+    try:
+        await M.fin_transactions.create_index("recurring_key", unique=True, partialFilterExpression={"recurring_key": {"$type": "string"}})
+        await M.fin_audit_logs.create_index([("created_at", -1)])
+        await M.fin_audit_logs.create_index("entity_id")
+    except Exception as exc:
+        log.error("index extra: %s", exc)
     await generate_recurring()
 
 
