@@ -65,6 +65,18 @@ def month_day(year: int, month: int, day: int) -> str:
     return date(year, month, min(day, calendar.monthrange(year, month)[1])).isoformat()
 
 
+def iso_date(v) -> str:
+    """'AAAA-MM-DD...' ou 'DD/MM/AAAA' → 'AAAA-MM-DD' ('' se inválida)."""
+    s = str(v or "").strip()
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})", s)
+    if m:
+        s = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    try:
+        return date.fromisoformat(s[:10]).isoformat()
+    except ValueError:
+        return ""
+
+
 def with_status(t: dict) -> dict:
     if t.get("status") == "previsto" and t["date"] < today():
         t["status"] = "atrasado"
@@ -230,13 +242,14 @@ async def on_os_updated(order: dict, techs: Optional[list] = None):
             return
         status = "pago" if order.get("visit_fee_paid") else "previsto"
         # Paga: entra na data em que foi marcada como paga. A receber: data de cadastro da OS.
-        reg = str(order.get("registration_date") or order.get("created_at") or "")[:10]
-        paid_on = str(order.get("updated_at") or "")[:10] or today()
+        reg = iso_date(order.get("registration_date") or order.get("created_at"))
+        paid_on = iso_date(order.get("updated_at")) or today()
         if existing:
             if existing.get("reconciled") or not existing.get("auto"):
                 return
             if status == "pago":
-                when = existing["date"] if existing["status"] == "pago" and existing["date"] != reg else paid_on
+                keep = existing["status"] == "pago" and existing["date"] != reg and iso_date(existing["date"]) == existing["date"]
+                when = existing["date"] if keep else paid_on
             else:
                 when = reg or existing["date"]
             if existing["amount"] != round(fee, 2) or existing["status"] != status or existing["date"] != when:
@@ -668,6 +681,126 @@ async def overview(start: str, end: str, technician_id: Optional[str] = None, us
     return {"current": summarize(cur), "previous": summarize(prev), "previous_range": {"start": ps, "end": pe},
             "by_category": sorted(by_cat.values(), key=lambda x: -x["total"]), "ranking": rank,
             "series": sorted(series.values(), key=lambda x: x["date"]), "budget_alerts": alerts, "due_soon": due}
+
+
+AGING = [("a_vencer", "A vencer", None, 0), ("d1_7", "1–7 dias", 1, 7), ("d8_15", "8–15 dias", 8, 15),
+         ("d16_30", "16–30 dias", 16, 30), ("d31_60", "31–60 dias", 31, 60), ("d60", "+60 dias", 61, 10 ** 6)]
+
+
+@router.get("/finance/command-center")
+async def command_center(start: str, end: str, user: dict = Depends(require_finance)):
+    """Painel executivo: caixa, a receber/pagar, lucro, fluxo semanal (realizado + projetado), atraso e central de aten\u00e7\u00e3o."""
+    await generate_recurring()
+    sync_fee_entries()
+    admin = user["role"] == "admin"
+    q = {**scope(user)}
+    td = parse_date(today())
+    horizon = (td + timedelta(days=28)).isoformat()
+    in7 = (td + timedelta(days=7)).isoformat()
+    open_txs = [with_status(t) for t in await M.fin_transactions.find({**q, "status": {"$ne": "pago"}}, NO_ID).to_list(50000)]
+    paid_all = await M.fin_transactions.find({**q, "status": "pago"}, {"_id": 0, "type": 1, "amount": 1, "date": 1}).to_list(100000)
+    period = [with_status(t) for t in await M.fin_transactions.find({**q, "date": {"$gte": start, "$lte": end}}, NO_ID).to_list(50000)]
+
+    def side(kind):
+        rows = [t for t in open_txs if t["type"] == kind]
+        late = [t for t in rows if t["status"] == "atrasado"]
+        nxt = [t for t in rows if today() <= t["date"] <= in7]
+        return {"total": round(sum(t["amount"] for t in rows), 2), "count": len(rows),
+                "atrasado": round(sum(t["amount"] for t in late), 2), "atrasado_count": len(late),
+                "prox7": round(sum(t["amount"] for t in nxt), 2), "prox7_count": len(nxt)}
+
+    receber, pagar = side("entrada"), (side("saida") if admin else None)
+
+    # Caixa: saldo banc\u00e1rio (Open Finance) quando houver conta conectada; sen\u00e3o, realizado acumulado.
+    accounts = await M.fin_bank_accounts.find({}, NO_ID).to_list(100) if admin else []
+    bank_balance = sum(float(a.get("balance") or 0) for a in accounts if a.get("type") != "CREDIT")
+    realized = sum(t["amount"] if t["type"] == "entrada" else -t["amount"] for t in paid_all)
+    caixa = {"valor": round(bank_balance if accounts else realized, 2), "fonte": "bancos" if accounts else "realizado", "contas": len(accounts)}
+
+    s = summarize(period)
+    lucro = {"valor": s["saldo"], "receita": s["entradas_pagas"], "despesa": s["saidas_pagas"],
+             "margem_pct": round(s["saldo"] / s["entradas_pagas"] * 100, 1) if s["entradas_pagas"] else None}
+
+    # Fluxo semanal: semanas do per\u00edodo (realizado) + pr\u00f3ximas 4 (projetado), saldo acumulado a partir do caixa.
+    wk0 = parse_date(start) - timedelta(days=parse_date(start).weekday())
+    weeks, w = [], wk0
+    while w.isoformat() <= max(end, horizon):
+        weeks.append({"start": w.isoformat(), "end": (w + timedelta(days=6)).isoformat(),
+                      "entradas": 0.0, "saidas": 0.0, "entradas_prev": 0.0, "saidas_prev": 0.0})
+        w += timedelta(days=7)
+    first = weeks[0]["start"]
+    seen = set()
+    for t in period + open_txs:
+        if t["id"] in seen or t["date"] < first:
+            continue
+        seen.add(t["id"])
+        idx = (parse_date(t["date"]) - wk0).days // 7
+        if idx >= len(weeks):
+            continue
+        paid = t["status"] == "pago"
+        # Em aberto e j\u00e1 vencido entra como previsto na semana atual.
+        if not paid and t["date"] < today():
+            idx = max(0, (td - wk0).days // 7)
+            if idx >= len(weeks):
+                continue
+        key = ("entradas" if t["type"] == "entrada" else "saidas") + ("" if paid else "_prev")
+        weeks[idx][key] += t["amount"]
+    bal = caixa["valor"]
+    for wk in weeks:
+        for k in ("entradas", "saidas", "entradas_prev", "saidas_prev"):
+            wk[k] = round(wk[k], 2)
+        wk["futura"] = wk["start"] > today()
+        if wk["end"] >= today():
+            bal += wk["entradas_prev"] - wk["saidas_prev"]
+            wk["saldo_projetado"] = round(bal, 2)
+
+    aging = []
+    for key, label, lo, hi in AGING:
+        rows = [t for t in open_txs if t["type"] == "entrada" and (
+            t["date"] >= today() if lo is None else lo <= (td - parse_date(t["date"])).days <= hi)]
+        aging.append({"key": key, "label": label, "total": round(sum(t["amount"] for t in rows), 2), "count": len(rows)})
+
+    attention = []
+    if receber["atrasado_count"]:
+        attention.append({"level": "critico", "title": f"{receber['atrasado_count']} recebimento(s) vencido(s)",
+                          "detail": f"{brl_py(receber['atrasado'])} precisam de cobran\u00e7a ou revis\u00e3o.", "tab": "entradas"})
+    if admin and pagar["atrasado_count"]:
+        attention.append({"level": "critico", "title": f"{pagar['atrasado_count']} conta(s) a pagar vencida(s)",
+                          "detail": f"{brl_py(pagar['atrasado'])} em atraso.", "tab": "saidas"})
+    neg = next((wk for wk in weeks if wk.get("saldo_projetado") is not None and wk["saldo_projetado"] < 0), None)
+    if admin and neg:
+        attention.append({"level": "critico", "title": "Saldo projetado negativo",
+                          "detail": f"Semana de {neg['start'][8:10]}/{neg['start'][5:7]}: {brl_py(neg['saldo_projetado'])} se nada mudar.", "tab": "visao-geral"})
+    if admin:
+        for b in await budget_status():
+            if b["pct"] >= 80:
+                attention.append({"level": "critico" if b["pct"] >= 100 else "atencao",
+                                  "title": f"Or\u00e7amento de {b['category_name']} em {b['pct']}%",
+                                  "detail": f"{brl_py(b['spent'])} de {brl_py(b['monthly_limit'])} no m\u00eas.", "tab": "metas-limites"})
+        if pagar["prox7_count"]:
+            attention.append({"level": "atencao", "title": f"{pagar['prox7_count']} conta(s) vencem em 7 dias",
+                              "detail": f"{brl_py(pagar['prox7'])} a pagar at\u00e9 {in7[8:10]}/{in7[5:7]}.", "tab": "saidas"})
+        pend = await M.fin_bank_transactions.count_documents({"handled": None})
+        if pend:
+            attention.append({"level": "info", "title": f"{pend} movimenta\u00e7\u00e3o(\u00f5es) banc\u00e1ria(s) sem concilia\u00e7\u00e3o",
+                              "detail": "H\u00e1 pend\u00eancias na confer\u00eancia banc\u00e1ria.", "tab": "bancos"})
+        for it in await M.fin_bank_items.find({}, NO_ID).to_list(50):
+            ls = str(it.get("last_sync") or "")[:10]
+            if ls and (td - parse_date(ls)).days >= 3:
+                attention.append({"level": "atencao", "title": f"Banco {it.get('connector') or ''} sem sincronizar",
+                                  "detail": f"\u00daltima sincroniza\u00e7\u00e3o em {ls[8:10]}/{ls[5:7]}.", "tab": "bancos"})
+    fees = [t for t in open_txs if t.get("source") == "os" and t.get("os_key") == "taxa"]
+    if fees:
+        attention.append({"level": "info", "title": f"{len(fees)} taxa(s) de visita a receber",
+                          "detail": f"{brl_py(sum(t['amount'] for t in fees))} em taxas n\u00e3o pagas.", "tab": "entradas"})
+    order = {"critico": 0, "atencao": 1, "info": 2}
+    attention.sort(key=lambda a: order[a["level"]])
+    return {"caixa": caixa, "receber": receber, "pagar": pagar, "lucro": lucro, "weeks": weeks,
+            "aging": aging, "attention": attention, "today": today()}
+
+
+def brl_py(v: float) -> str:
+    return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 # ---------- Despesas fixas ----------

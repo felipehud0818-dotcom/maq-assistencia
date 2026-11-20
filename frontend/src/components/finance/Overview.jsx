@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, PieChart, Pie, Cell, Legend } from "recharts";
-import { AlertTriangle, CalendarClock, Trophy } from "lucide-react";
+import { Trophy } from "lucide-react";
 import { api, errMsg } from "@/components/finance/api";
 import { brl, fmtDate, change } from "@/lib/format";
 import { useAuth } from "@/context/AuthContext";
 import { useRef_ } from "@/components/finance/RefData";
-import { Card, Delta, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty, StatusBadge, ExportButton } from "@/components/finance/common";
+import { Card, Delta, PeriodFilter, initialPeriod, SimpleSelect, SectionTitle, Empty, ExportButton } from "@/components/finance/common";
 import { toast } from "sonner";
+import CommandCenter from "@/components/finance/CommandCenter";
 
 const Kpi = ({ id, label, value, delta, invert, hint, tone }) => (
   <Card className="p-5" data-testid={`kpi-card-${id}`}>
@@ -34,40 +35,6 @@ const CategoryPie = ({ title, data, testId }) => (
     )}
   </Card>
 );
-
-const Alerts = ({ alerts, due }) => {
-  if (!alerts.length && !due.length) return null;
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {alerts.length > 0 && (
-        <Card className="p-5 border-amber-200 bg-amber-50/40" data-testid="overview-budget-alerts">
-          <h3 className="font-semibold text-slate-900 flex items-center gap-2"><AlertTriangle size={16} className="text-amber-600" />Limites de categoria</h3>
-          <ul className="mt-3 space-y-1.5 text-sm">
-            {alerts.map((b) => (
-              <li key={b.id} className="flex justify-between">
-                <span>{b.category_name}</span>
-                <span className={b.pct >= 100 ? "text-rose-700 font-semibold" : "text-amber-700 font-semibold"}>{b.pct}% de {brl(b.monthly_limit)}</span>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-      {due.length > 0 && (
-        <Card className="p-5" data-testid="overview-due-soon">
-          <h3 className="font-semibold text-slate-900 flex items-center gap-2"><CalendarClock size={16} className="text-blue-600" />Contas a pagar (próximos 7 dias e em atraso)</h3>
-          <ul className="mt-3 space-y-1.5 text-sm">
-            {due.slice(0, 6).map((t) => (
-              <li key={t.id} className="flex justify-between gap-2">
-                <span className="truncate">{fmtDate(t.date)} · {t.description}</span>
-                <span className="flex items-center gap-2 shrink-0"><StatusBadge status={t.status} />{brl(t.amount)}</span>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-    </div>
-  );
-};
 
 const Ranking = ({ rows }) => (
   <Card className="p-5" data-testid="overview-tech-ranking">
@@ -112,7 +79,7 @@ export default function Overview() {
 
   return (
     <>
-      <SectionTitle title="Visão Geral" subtitle={`Comparando com ${fmtDate(data.previous_range.start)} a ${fmtDate(data.previous_range.end)}`}>
+      <SectionTitle title="Painel executivo" subtitle={`Comparando com ${fmtDate(data.previous_range.start)} a ${fmtDate(data.previous_range.end)}`}>
         <PeriodFilter period={period} setPeriod={setPeriod} />
         <ExportButton filename={`visao-geral-${period.start}-a-${period.end}`} sheets={() => ({
           Resumo: [{ "Entrou (recebido)": c.entradas_pagas, "Saiu (pago)": c.saidas_pagas, Saldo: c.saldo, "Falta receber": c.a_receber, "Em atraso": c.atrasado_receber, "A pagar": c.a_pagar, "Saldo previsto": c.saldo_previsto }],
@@ -123,13 +90,14 @@ export default function Overview() {
         {isAdmin && <SimpleSelect value={tech} onChange={setTech} testId="filter-technician-select"
           options={[{ value: "all", label: "Todos os técnicos" }, ...techs.map((t) => ({ value: t.id, label: t.name }))]} />}
       </SectionTitle>
+      {tech === "all" && <CommandCenter period={period} />}
+      <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500 pt-2">Movimento do período</h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Kpi id="entradas" label="Entrou (recebido)" value={c.entradas_pagas} delta={change(c.entradas_pagas, p.entradas_pagas)} tone="text-emerald-700" />
         <Kpi id="saidas" label="Saiu (pago)" value={c.saidas_pagas} delta={change(c.saidas_pagas, p.saidas_pagas)} invert tone="text-rose-700" />
         <Kpi id="saldo" label="Saldo do período" value={c.saldo} delta={change(c.saldo, p.saldo)} tone={c.saldo >= 0 ? "text-slate-900" : "text-rose-700"} />
         <Kpi id="a-receber" label="Falta receber" value={c.a_receber} hint={`${brl(c.atrasado_receber)} em atraso · saldo previsto ${brl(c.saldo_previsto)}`} tone="text-amber-700" />
       </div>
-      {isAdmin && <Alerts alerts={data.budget_alerts} due={data.due_soon} />}
       <Card className="p-5" data-testid="overview-series-chart">
         <h3 className="text-base font-semibold text-slate-900 mb-3">Entradas x saídas por dia</h3>
         {data.series.length === 0 ? <Empty text="Sem lançamentos no período" /> : (
