@@ -8,7 +8,7 @@ import logging
 import subprocess
 import unicodedata
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
@@ -205,6 +205,18 @@ async def _routes_context(db, q: str = ""):
     routes = _routes_cache["docs"]
     toks = _tokens(q)
     nums = set(re.findall(r"\d{4,}", q))
+    # Datas citadas (19/11/26, 19/11/2026, 2026-11-19, hoje/ontem/amanhã) valem muito mais que palavras soltas.
+    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", q))
+    for d, m, y in re.findall(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", q):
+        yy = int(y) + 2000 if y and len(y) == 2 else int(y) if y else datetime.now().year
+        try:
+            dates.add(datetime(yy, int(m), int(d)).date().isoformat())
+        except ValueError:
+            pass
+    base = datetime.now().date()
+    for word, delta in (("hoje", 0), ("ontem", -1), ("amanha", 1), ("amanhã", 1)):
+        if re.search(rf"\b{word}\b", q.lower()):
+            dates.add((base + timedelta(days=delta)).isoformat())
 
     def orders_of(r):
         return [o for o in (r.get("orders") if isinstance(r.get("orders"), list) else []) if isinstance(o, dict)]
@@ -217,19 +229,23 @@ async def _routes_context(db, q: str = ""):
     for r in routes:
         blob = _norm(" ".join(str(v) for v in (r.get("name"), r.get("technician"), r.get("date"), r.get("status")))
                      + " " + " ".join(f"{o.get('os_number')} {o.get('customer_name')} {o.get('neighborhood')}" for o in orders_of(r)))
-        s = sum(1 for t in toks if t in blob) + sum(50 for n in nums if n in blob)
+        s = sum(1 for t in toks if t in blob) + sum(50 for n in nums if n in blob) + (100 if str(r.get("date") or "")[:10] in dates else 0)
         if s:
             scored.append((s, r))
     scored.sort(key=lambda x: x[0], reverse=True)
-    lines = []
-    for _, r in scored[:8]:
+    lines, nums_out = [], []
+    top = scored[0][0] if scored else 0
+    for s, r in scored[:8]:
         lines.append("- " + head(r))
         lines += [f"    {o.get('sequence')}. OS {o.get('os_number')}; {o.get('customer_name') or ''}; {o.get('address') or ''} "
                   f"{o.get('number') or ''} {o.get('complement') or ''}, {o.get('neighborhood') or ''}, {o.get('city') or ''}; "
-                  f"status {o.get('status') or ''}" for o in orders_of(r)]
+                  f"situação da parada {o.get('stop_status') or 'pendente'} (status atual da OS: ver ficha em 'OSs relacionadas')"
+                  for o in sorted(orders_of(r), key=lambda o: o.get('sequence') or 0)]
+        if s >= top * 0.6 and len(nums_out) < 40:
+            nums_out += [str(o.get("os_number")) for o in orders_of(r) if o.get("os_number")]
     lines.append("Recentes:")
     lines += ["- " + head(r) + "; OSs: " + ", ".join(str(o.get("os_number")) for o in orders_of(r)) for r in routes[:15]]
-    return "\n".join(lines)
+    return "\n".join(lines), list(dict.fromkeys(nums_out))[:40]
 
 
 async def _search_manuals(mongo_db, q: str, limit: int = 8):
@@ -248,7 +264,10 @@ SYSTEM = (
     "Responda sempre em português do Brasil. Use SOMENTE os dados de contexto fornecidos (OSs, roteiros, "
     "localização das OSs e trechos de manuais). Ao usar um manual, cite o nome do manual e a página. "
     "Para ajudar a montar roteiros, agrupe OSs próximas pela distância informada (máximo 9 OSs por roteiro). "
-    "Se a informação não estiver no contexto, diga que não encontrou — nunca invente números, códigos, peças ou procedimentos.\n"
+    "Se a informação não estiver no contexto, diga que não encontrou — nunca invente números, códigos, peças ou procedimentos. "
+    "Antes de dizer que não encontrou uma OS, procure-a pelo número na seção 'OSs relacionadas' (ela traz a ficha completa e atual de "
+    "toda OS citada ou que esteja num roteiro citado). Para status de OS use SEMPRE a ficha (campo status), nunca o roteiro. "
+    "Quando o usuário pedir um formato, siga exatamente esse formato para todas as OSs, na ordem de sequência do roteiro.\n"
     "FORMATO (obrigatório): responda como o ChatGPT numa conversa normal — vá direto ao ponto, sem repetir a "
     "pergunta e sem frases de enchimento. Parágrafos curtos; listas com '-' ou '1.' quando houver vários itens. "
     "NUNCA use tabelas, barras verticais '|', linhas '---', citações '>' ou blocos de código. "
@@ -429,7 +448,16 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
         man_hits = await _search_manuals(mongo_db, f"{text} {hist_q[-150:]}", limit=10)
         geo_txt = _geo_context(text) or _geo_context(f"{text} {hist_q}")
         region_txt = mi_agent.region_context(text, _os_cache["docs"])
-        routes_txt = await _routes_context(db, f"{text} {hist_q[-200:]}")
+        routes_txt, route_nums = await _routes_context(db, f"{text} {hist_q[-200:]}")
+        # OSs dos roteiros citados: dados completos e atuais direto do banco (endereço, aparelho, defeito, status).
+        have = {str(d.get("os_number")) for d in os_hits}
+        for n in route_nums:
+            if n in have:
+                continue
+            f = await db.service_orders.find_one({"os_number": n}, {k: 1 for k in OS_FIELDS})
+            if f:
+                os_hits.append(f)
+                have.add(n)
         titles = [d["title"] async for d in mongo_db["mi_manual_index"].find({}, {"title": 1})]
         wa_txt = ""
         if re.search(r"whats|zap|wpp|mensag", text, re.I):
@@ -458,22 +486,26 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
             + f"## Conversa anterior\n{hist_txt or '(início)'}\n\n"
             f"## Pergunta\n{text}"
         )
-        try:
-            # Universal Key sem saldo: pula direto p/ Ollama por 10 min (evita esperar o erro a cada pergunta).
-            if time.time() < _llm_state["openai_off_until"]:
-                raise RuntimeError("openai em pausa")
-            from emergentintegrations.llm.chat import LlmChat, UserMessage
-            chat = LlmChat(api_key=os.environ.get("MI_LLM_KEY") or os.environ["EMERGENT_LLM_KEY"], session_id=f"mi-{cid}", system_message=SYSTEM_FULL).with_model("openai", MODEL)
-            answer = (await chat.send_message(UserMessage(text=prompt)) or "").strip()
-        except Exception as e:
-            if "pausa" not in str(e):
-                _llm_state["openai_off_until"] = time.time() + 600
-                logger.warning(f"[Mi] Universal Key falhou, usando Ollama: {e!r}")
+        answer = ""
+        keys = [k for k in dict.fromkeys([os.environ.get("MI_LLM_KEY"), os.environ.get("EMERGENT_LLM_KEY")]) if k]
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        # Tenta a chave do Mi; sem saldo, cai para a Universal Key da conta; por último o Ollama.
+        for i, key in enumerate(keys):
+            if time.time() < _llm_state.get(f"off_{i}", 0):
+                continue
+            try:
+                chat = LlmChat(api_key=key, session_id=f"mi-{cid}", system_message=SYSTEM_FULL).with_model("openai", MODEL)
+                answer = (await chat.send_message(UserMessage(text=prompt)) or "").strip()
+                break
+            except Exception as e:
+                _llm_state[f"off_{i}"] = time.time() + 600
+                logger.warning(f"[Mi] chave {i + 1} falhou: {str(e)[-200:]}")
+        if not answer:
             try:
                 answer = await _ollama_chat(prompt)
             except Exception as e2:
                 logger.error(f"[Mi] Ollama falhou: {e2!r}")
-                raise HTTPException(status_code=424, detail="Falha ao consultar a IA (Universal Key e Ollama).")
+                raise HTTPException(status_code=424, detail="A IA está sem saldo: a chave do Mi e a Universal Key esgotaram e o Ollama está sem créditos. Adicione saldo em Perfil → Universal Key.")
 
         answer, acts = mi_agent.parse_actions(answer)
         actions = []

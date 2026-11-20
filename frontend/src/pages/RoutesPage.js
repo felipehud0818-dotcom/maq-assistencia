@@ -272,6 +272,8 @@ const BASE_LNG = -43.9420748;
 const hasCoords = (o) => o != null && o.lat != null && o.lng != null && o.lat !== '' && o.lng !== ''
   && Number.isFinite(Number(o.lat)) && Number.isFinite(Number(o.lng));
 const MAX_ROUTE_OS = 9;
+const WEEKDAYS = ['DOMINGO', 'SEGUNDA-FEIRA', 'TERÇA-FEIRA', 'QUARTA-FEIRA', 'QUINTA-FEIRA', 'SEXTA-FEIRA', 'SÁBADO'];
+const weekdayName = (iso) => (iso ? WEEKDAYS[new Date(`${iso}T12:00:00`).getDay()] : 'ROTEIRO');
 
 // Garantia x Orçamento (Fora de garantia conta como orçamento: o cliente paga).
 const attendKind = (o) => {
@@ -2773,24 +2775,27 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
       let distance = p.edited ? '' : `${p.meta.distance_km} km`;
       let duration = '';
       if (!p.edited) { const m = p.meta.total_minutes; duration = m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}min` : `${m}min`; }
-      if (p.edited) {
-        try {
-          const r = await axios.post(`${API}/routes/compute-route`, {
-            origin: { lat: BASE_LAT, lng: BASE_LNG }, destination: { lat: BASE_LAT, lng: BASE_LNG },
-            intermediates: p.orders.map(o => ({ lat: o.lat, lng: o.lng })), optimize_waypoint_order: false, round_trip: true,
-          }, getAuthHeader());
-          const legs = r.data.routes?.[0]?.legs || [];
-          const dist = legs.reduce((s, l) => s + (l.distanceMeters || 0), 0);
-          const mins = Math.round(legs.reduce((s, l) => s + (parseInt((l.duration || '0').replace('s', ''), 10) || 0), 0) / 60);
-          if (legs.length) { distance = `${(dist / 1000).toFixed(1)} km`; duration = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}min` : `${mins}min`; }
-        } catch (e) { console.warn('compute-route falhou', e); }
-      }
+      let ordered = p.orders;
+      // Rota calculada de verdade: sai da base, ordem otimizada das OSs e volta à base.
+      try {
+        const r = await axios.post(`${API}/routes/compute-route`, {
+          origin: { lat: BASE_LAT, lng: BASE_LNG }, destination: { lat: BASE_LAT, lng: BASE_LNG },
+          intermediates: p.orders.map(o => ({ lat: o.lat, lng: o.lng })), optimize_waypoint_order: true, round_trip: true,
+        }, getAuthHeader());
+        const route = r.data.routes?.[0];
+        const legs = route?.legs || [];
+        const idx = route?.optimizedIntermediateWaypointIndex;
+        if (Array.isArray(idx) && idx.length === p.orders.length) ordered = idx.map(i => p.orders[i]);
+        const dist = legs.reduce((s, l) => s + (l.distanceMeters || 0), 0);
+        const mins = Math.round(legs.reduce((s, l) => s + (parseInt((l.duration || '0').replace('s', ''), 10) || 0), 0) / 60);
+        if (legs.length) { distance = `${(dist / 1000).toFixed(1)} km`; duration = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}min` : `${mins}min`; }
+      } catch (e) { console.warn('compute-route falhou', e); }
       try {
         await axios.post(`${API}/routes/`, {
-          name: `${p.name.split(' · ').slice(1).join(' · ') || p.name} · ${tech}`,
+          name: weekdayName(routeDate),
           technician: tech,
           date: routeDate,
-          orders: p.orders.map((o, i) => routeOrderPayload(o, i + 1, tech)),
+          orders: ordered.map((o, i) => routeOrderPayload(o, i + 1, tech)),
           total_distance: distance,
           total_duration: duration,
           status: 'Pendente',
@@ -2953,7 +2958,7 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
       const orders = optimizedOrders.map(o => routeOrderPayload(o, o.sequence, routeTechnician));
 
       await axios.post(`${API}/routes/`, {
-        name: routeName || `Roteiro ${routeDate}`,
+        name: routeName || weekdayName(routeDate),
         technician: routeTechnician,
         date: routeDate,
         orders,
