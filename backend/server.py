@@ -60,6 +60,12 @@ env_file = ROOT_DIR / '.env'
 if env_file.exists():
     load_dotenv(env_file, override=False)  # Don't override existing env vars
 
+# Banco novo (migração): as chaves do projeto Supabase novo substituem as antigas neste processo.
+for _new, _old in (("NEW_SUPABASE_URL", "SUPABASE_URL"), ("NEW_SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_KEY"),
+                   ("NEW_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY")):
+    if os.environ.get(_new):
+        os.environ[_old] = os.environ[_new]
+
 # Configure logging - WARNING level reduces Railway log volume (INFO for startup only)
 logging.basicConfig(
     level=logging.WARNING,

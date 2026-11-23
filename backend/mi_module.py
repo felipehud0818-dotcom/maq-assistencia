@@ -55,19 +55,29 @@ async def _load_os(db):
         if time.time() - _os_cache["ts"] < 600 and _os_cache["docs"]:
             return
         proj = {f: 1 for f in OS_FIELDS}
-        docs, skip = [], 0
-        while True:
-            batch = await db.service_orders.find({}, proj).skip(skip).limit(1000).to_list(1000)
-            docs += batch
-            if len(batch) < 1000:
-                break
-            skip += 1000
+        # Anti-egress: carga completa só a cada 6h; no meio, busca apenas as OSs alteradas desde a última leitura.
+        if _os_cache["docs"] and time.time() - _os_cache.get("full_ts", 0) < 6 * 3600 and _os_cache.get("since"):
+            changed = await db.service_orders.find({"updated_at": {"$gt": _os_cache["since"]}}, proj).limit(1000).to_list(1000)
+            byn = {str(d.get("os_number")): d for d in _os_cache["docs"]}
+            for d in changed:
+                byn[str(d.get("os_number"))] = d
+            docs, full_ts = list(byn.values()), _os_cache["full_ts"]
+        else:
+            docs, skip = [], 0
+            while True:
+                batch = await db.service_orders.find({}, proj).skip(skip).limit(1000).to_list(1000)
+                docs += batch
+                if len(batch) < 1000:
+                    break
+                skip += 1000
+            full_ts = time.time()
+        since = max((str(d.get("updated_at") or "") for d in docs), default="")
         by_src_status = Counter((d.get("source") or "-", d.get("status") or "-") for d in docs)
         by_brand = Counter((d.get("brand") or "-").upper() for d in docs)
         lines = [f"Total de OSs no sistema: {len(docs)}", "Contagem por origem/status:"]
         lines += [f"- {s} | {st}: {n}" for (s, st), n in sorted(by_src_status.items())]
         lines.append("Top marcas: " + ", ".join(f"{b}: {n}" for b, n in by_brand.most_common(20)))
-        _os_cache.update(ts=time.time(), docs=docs, stats="\n".join(lines),
+        _os_cache.update(ts=time.time(), docs=docs, stats="\n".join(lines), full_ts=full_ts, since=since,
                          blobs=[_norm(" ".join(str(v) for v in d.values() if v)) for d in docs])
 
 
@@ -200,7 +210,7 @@ def _geo_context(q: str):
 
 async def _routes_context(db, q: str = ""):
     """Roteiros que batem com a pergunta (nome/técnico/data/OS/cliente, mesmo parcial) com detalhe + 15 recentes."""
-    if time.time() - _routes_cache["ts"] > 120:
+    if time.time() - _routes_cache["ts"] > 600:
         _routes_cache.update(ts=time.time(), docs=await db.routes.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000))
     routes = _routes_cache["docs"]
     toks = _tokens(q)

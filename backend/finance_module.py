@@ -318,16 +318,23 @@ async def _sync_fee_entries():
     try:
         techs = await technicians()
         fields = {**OS_FIELDS, "registration_date": 1, "created_at": 1}
+        # Anti-egress: varredura completa só a cada 6h (ou após mudar a data de corte); no meio, só OSs alteradas.
+        full = time.time() - _fee_sync.get("full_at", 0) > 6 * 3600 or not _fee_sync.get("since")
+        q = {"visit_fee": {"$gte": 0.01}} if full else {"updated_at": {"$gt": _fee_sync["since"]}}
+        started = now_iso()
         total, skip = 0, 0
         while True:  # Supabase devolve no máx. 1000 linhas por consulta
-            rows = await S.service_orders.find({"visit_fee": {"$gte": 0.01}}, fields).sort("os_number", 1).skip(skip).limit(1000).to_list(1000)
+            rows = await S.service_orders.find(q, fields).sort("os_number", 1).skip(skip).limit(1000).to_list(1000)
             for r in rows:
                 await on_os_updated(r, techs)
             total += len(rows)
             skip += 1000
             if len(rows) < 1000:
                 break
-        log.warning("sync taxas: %s OS verificadas", total)
+        _fee_sync["since"] = started
+        if full:
+            _fee_sync["full_at"] = time.time()
+        log.warning("sync taxas (%s): %s OS verificadas", "completa" if full else "incremental", total)
     except Exception as exc:
         log.error("sync taxas: %s", exc)
     finally:
@@ -893,6 +900,7 @@ async def save_settings(body: SettingsIn, user: dict = Depends(require_admin)):
                                        "actor_id": user.get("id"), "actor_name": user.get("name") or user.get("email"), "created_at": now_iso()})
     _settings["at"] = 0
     _fee_sync["at"] = 0
+    _fee_sync["full_at"] = 0
     sync_fee_entries()  # reaplica a regra das taxas em segundo plano
     return {"fee_since": since}
 

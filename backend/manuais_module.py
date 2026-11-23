@@ -61,7 +61,37 @@ def put_object(path: str, data: bytes, content_type: str) -> dict:
         data=data, timeout=300
     )
     resp.raise_for_status()
+    _disk_put(path, data, content_type)
     return {"path": path, "size": len(data)}
+
+
+# Anti-egress: todo arquivo baixado do Storage fica em cache no disco; nova leitura não sai do Supabase.
+OBJ_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "objects")
+
+
+def _disk_path(path: str) -> str:
+    return os.path.join(OBJ_CACHE, path.replace("..", "_"))
+
+
+def _disk_put(path: str, data: bytes, content_type: str):
+    try:
+        p = _disk_path(path)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        with open(p + ".ct", "w") as f:
+            f.write(content_type or "application/octet-stream")
+    except OSError as e:
+        logger.warning(f"cache de arquivo falhou ({path}): {e}")
+
+
+def _disk_get(path: str):
+    p = _disk_path(path)
+    if os.path.exists(p):
+        ct = open(p + ".ct").read() if os.path.exists(p + ".ct") else "application/octet-stream"
+        with open(p, "rb") as f:
+            return f.read(), ct
+    return None
 
 
 def _legacy_get_object(path: str):
@@ -84,11 +114,16 @@ def _legacy_get_object(path: str):
 
 
 def get_object(path: str):
+    hit = _disk_get(path)
+    if hit:
+        return hit
     resp = requests.get(f"{SB_BUCKET_URL}/{path}", headers=_sb_headers(), timeout=120)
     if resp.status_code in (400, 404):
         return _legacy_get_object(path)
     resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+    ct = resp.headers.get("Content-Type", "application/octet-stream")
+    _disk_put(path, resp.content, ct)
+    return resp.content, ct
 
 
 def _find_soffice() -> str:

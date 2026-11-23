@@ -386,6 +386,9 @@ async def os_stops(body: OSStopsIn, user: dict = Depends(get_current_user)):
     return out
 
 
+_os_search_cache = {"ts": 0.0, "docs": []}
+
+
 @router.get("/os-search")
 async def os_search(q: str, user: dict = Depends(get_current_user)):
     import unicodedata
@@ -394,7 +397,11 @@ async def os_search(q: str, user: dict = Depends(get_current_user)):
     q = q.strip()
     if len(q) < 2:
         return []
-    docs = await sysdb.service_orders.find({}, OS_PROJ).sort("created_at", -1).to_list(3000)
+    docs = _os_search_cache["docs"]
+    if not docs or time.time() - _os_search_cache["ts"] > 300:
+        # Anti-egress: a lista leve é baixada no máx. 1x a cada 5 min, não a cada tecla digitada.
+        docs = await sysdb.service_orders.find({}, OS_PROJ).sort("created_at", -1).to_list(3000)
+        _os_search_cache.update(ts=time.time(), docs=docs)
     nq = norm(q)
     hits = [d for d in docs if str(d.get("os_number", "")).startswith(q)
             or nq in norm(d.get("customer_name")) or nq in norm(d.get("neighborhood")) or nq in norm(d.get("address"))]

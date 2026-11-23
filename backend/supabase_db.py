@@ -29,6 +29,38 @@ def _pgrst_encode(v):
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
+# ---------- Política anti-estouro de egress ----------
+# 1) Leituras idênticas repetidas em 30s saem do cache em memória (invalidado em qualquer escrita na tabela).
+# 2) Listas de service_orders sem projeção nunca trazem as fotos base64 (photo_1..9 = ~80% do tamanho da tabela).
+import time as _time
+_READ_TTL = 30
+_read_cache: dict = {}
+SO_LIGHT_COLUMNS = (
+    "id,os_number,customer_name,registration_date,attendance_date,status,sub_status,micro_status,service_type,source,"
+    "brand,model,product,address,number,complement,neighborhood,city,state,cep,reference_point,phone1,phone2,landline,"
+    "email,technician,serial_number,batch,reported_defect,technical_diagnosis,installation_correct,required_parts,"
+    "voltage_f1f2,voltage_f1_terra,voltage_f2_terra,observations,priority,visit_fee,lat,lng,sort_date,status_orcamento,"
+    "conclusao_orcamento,assinafy_status,assinafy_document_id,scheduling_history,print_count,share_token,created_at,"
+    "updated_at,signature_client_name,signature_client_cpf,signature_date,signature_tech_name,visit_fee_paid,site_info")
+
+
+def _cache_get(table: str, url: str):
+    hit = _read_cache.get(table, {}).get(url)
+    if hit and _time.time() - hit[0] < _READ_TTL:
+        return hit[1]
+    return None
+
+
+def _cache_put(table: str, url: str, data):
+    bucket = _read_cache.setdefault(table, {})
+    if len(bucket) > 300:
+        bucket.clear()
+    bucket[url] = (_time.time(), data)
+
+
+def _bust(table: str):
+    _read_cache.pop(table, None)
+
 # Shared connection pool - prevents ConnectTimeout under load
 _http_client = None
 
@@ -167,12 +199,19 @@ class SupabaseCollection:
         if filters:
             url += f"&{filters}"
 
+        cached = _cache_get(self.table, url)
+        if cached is not None:
+            return self._unmap_doc(cached[0]) if cached else None
         c = _get_client()
         r = await c.get(url, headers={**_headers(), "Accept": "application/json"}, timeout=15)
 
-        if r.status_code not in (200, 206) or not r.json():
+        if r.status_code not in (200, 206):
             return None
-        doc = r.json()[0]
+        rows = r.json()
+        _cache_put(self.table, url, rows)
+        if not rows:
+            return None
+        doc = rows[0]
         return self._unmap_doc(doc)
 
     def find(self, query: dict = None, projection: dict = None):
@@ -180,6 +219,7 @@ class SupabaseCollection:
         return FindCursor(self, query or {}, projection)
 
     async def insert_one(self, doc: dict):
+        _bust(self.table)
         doc = dict(doc)
         doc.pop("_id", None)
         mapped = self._map_doc(doc)
@@ -191,6 +231,7 @@ class SupabaseCollection:
             raise RuntimeError(f"insert_one {self.table} failed: {r.status_code} - {r.text[:200]}")
 
     async def update_one(self, query: dict, update: dict, upsert: bool = False):
+        _bust(self.table)
         set_data = update.get("$set", update)
         set_data.pop("_id", None)
         mapped = self._map_doc(set_data)
@@ -223,6 +264,7 @@ class SupabaseCollection:
         return Result()
 
     async def update_many(self, query: dict, update: dict):
+        _bust(self.table)
         set_data = update.get("$set", update)
         set_data.pop("_id", None)
         mapped = self._map_doc(set_data)
@@ -245,6 +287,7 @@ class SupabaseCollection:
         return Result()
 
     async def delete_one(self, query: dict):
+        _bust(self.table)
         filters = self._build_filters(query)
         url = f"{self.url}?{filters}&limit=1"
         c = _get_client()
@@ -338,6 +381,8 @@ class FindCursor:
             self._limit_val = length
 
         select = self.col._select_from_projection(self.projection)
+        if select == "*" and self.col.table == "service_orders":
+            select = SO_LIGHT_COLUMNS
         filters = self.col._build_filters(self.query)
 
         url = f"{self.col.url}?select={select}"
@@ -354,14 +399,16 @@ class FindCursor:
 
         url += f"&offset={self._skip}&limit={self._limit_val}"
 
-        c = _get_client()
-        r = await c.get(url, headers=_headers(), timeout=30)
-
-        if r.status_code not in (200, 206):
-            logger.error(f"find {self.col.table}: {r.status_code} - {r.text[:200]}")
-            return []
-
-        docs = r.json()
+        docs = _cache_get(self.col.table, url)
+        if docs is None:
+            c = _get_client()
+            r = await c.get(url, headers=_headers(), timeout=30)
+            if r.status_code not in (200, 206):
+                logger.error(f"find {self.col.table}: {r.status_code} - {r.text[:200]}")
+                return []
+            docs = r.json()
+            _cache_put(self.col.table, url, docs)
+        docs = list(docs)
         # Handle numeric ordering for os_number in Python if needed
         if self._collation and self._collation.get("numericOrdering") and self._sort_field == "os_number":
             try:
@@ -381,6 +428,8 @@ class FindCursor:
     async def __anext__(self):
         if not self._iter_buffer and not self._iter_done:
             select = self.col._select_from_projection(self.projection)
+            if select == "*" and self.col.table == "service_orders":
+                select = SO_LIGHT_COLUMNS
             filters = self.col._build_filters(self.query)
             url = f"{self.col.url}?select={select}"
             if filters:
