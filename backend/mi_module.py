@@ -1,4 +1,6 @@
 """Mi — assistente IA com contexto de todas as OSs (Supabase) e do texto dos manuais (indexado no Mongo)."""
+from dotenv import dotenv_values
+import hashlib
 import os
 import re
 import time
@@ -311,6 +313,31 @@ class ChatBody(BaseModel):
 SYSTEM_FULL = (SYSTEM + "\nREGIONAIS DE SABARÁ (use para localizar OSs e montar roteiros):\n" + mi_agent.regions_text()
                + "\n\n" + mi_agent.ACTIONS_PROMPT)
 
+def _get_mi_llm_keys():
+    """
+    Lê as chaves diretamente do backend/.env em cada chamada.
+    Aceita uma chave ou várias, separadas por vírgula.
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+    try:
+        config = dotenv_values(env_path)
+    except Exception as e:
+        logger.error(f"[Mi] Erro ao ler .env: {e}")
+        config = {}
+
+    keys = []
+
+    # MI_LLM_KEYS permite configurar várias chaves.
+    # MI_LLM_KEY continua sendo a opção de chave única.
+    for variable in ("MI_LLM_KEYS", "MI_LLM_KEY"):
+        raw = config.get(variable) or ""
+        for key in re.split(r"[,;\n]+", str(raw)):
+            key = key.strip().strip('"').strip("'")
+            if key and key not in keys:
+                keys.append(key)
+
+    return keys
 
 def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
     convs, msgs = mongo_db["mi_conversations"], mongo_db["mi_messages"]
@@ -497,25 +524,62 @@ def setup_mi_routes(api_router: APIRouter, db, mongo_db, require_admin):
             f"## Pergunta\n{text}"
         )
         answer = ""
-        keys = [k for k in dict.fromkeys([os.environ.get("MI_LLM_KEY"), os.environ.get("EMERGENT_LLM_KEY")]) if k]
+
+        keys = _get_mi_llm_keys()
+
         from emergentintegrations.llm.chat import LlmChat, UserMessage
-        # Tenta a chave do Mi; sem saldo, cai para a Universal Key da conta; por último o Ollama.
+
+        if not keys:
+            logger.warning("[Mi] Nenhuma MI_LLM_KEY configurada em backend/.env")
+
+        # Tenta as chaves da Mi em sequência.
+        # Cada chave possui seu próprio controle de falhas.
         for i, key in enumerate(keys):
-            if time.time() < _llm_state.get(f"off_{i}", 0):
+            key_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+            cooldown_key = f"off_{key_id}"
+
+            if time.time() < _llm_state.get(cooldown_key, 0):
                 continue
+
             try:
-                chat = LlmChat(api_key=key, session_id=f"mi-{cid}", system_message=SYSTEM_FULL).with_model("openai", MODEL)
-                answer = (await chat.send_message(UserMessage(text=prompt)) or "").strip()
-                break
+                chat = (
+                    LlmChat(
+                        api_key=key,
+                        session_id=f"mi-{cid}",
+                        system_message=SYSTEM_FULL
+                    ).with_model("openai", MODEL)
+                )
+
+                answer = (
+                    await chat.send_message(UserMessage(text=prompt)) or ""
+                ).strip()
+
+                if answer:
+                    logger.info(f"[Mi] Resposta gerada pela chave {i + 1}")
+                    break
+
             except Exception as e:
-                _llm_state[f"off_{i}"] = time.time() + 600
-                logger.warning(f"[Mi] chave {i + 1} falhou: {str(e)[-200:]}")
+                _llm_state[cooldown_key] = time.time() + 30
+                logger.warning(
+                    f"[Mi] Chave {i + 1} falhou: {str(e)[-200:]}"
+                )
+
+        # Último fallback: Ollama.
         if not answer:
             try:
                 answer = await _ollama_chat(prompt)
-            except Exception as e2:
-                logger.error(f"[Mi] Ollama falhou: {e2!r}")
-                raise HTTPException(status_code=424, detail="A IA está sem saldo: a chave do Mi e a Universal Key esgotaram e o Ollama está sem créditos. Adicione saldo em Perfil → Universal Key.")
+
+            except Exception as e:
+                logger.error(f"[Mi] Ollama falhou: {e!r}")
+
+                raise HTTPException(
+                    status_code=424,
+                    detail=(
+                        "Não foi possível utilizar nenhum provedor de IA. "
+                        "Verifique MI_LLM_KEY/MI_LLM_KEYS no backend/.env "
+                        "e a configuração do Ollama."
+                    )
+                )
 
         answer, acts = mi_agent.parse_actions(answer)
         actions = []

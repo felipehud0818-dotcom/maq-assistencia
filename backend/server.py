@@ -55,7 +55,6 @@ cache = SimpleCache()
 # ──────────────────────────────────────────────────────────────────
 
 # Load .env file ONLY if it exists and ONLY for development
-# In production (Railway), environment variables should be set via the dashboard
 env_file = ROOT_DIR / '.env'
 if env_file.exists():
     load_dotenv(env_file, override=False)  # Don't override existing env vars
@@ -1368,7 +1367,7 @@ async def get_next_invisacook_number(_: dict = Depends(verify_token)):
 @api_router.post("/service-orders")
 async def create_service_order(order: ServiceOrderCreate, payload: dict = Depends(verify_token)):
     # Check if OS already exists
-    existing = await db.service_orders.find_one({"os_number": order.os_number}, {"_id": 0})
+    existing = await db.service_orders.find_one({"os_number": order.os_number}, {"_id": 0, "os_number": 1})
     if existing:
         raise HTTPException(status_code=400, detail="Ordem de Serviço já cadastrada")
 
@@ -2029,8 +2028,17 @@ async def sign_service_order(os_number: str, sign_data: SignRequest, background_
 
     await db.service_orders.update_one({"os_number": os_number}, {"$set": update_data})
 
-    updated = await db.service_orders.find_one({"os_number": os_number}, {"_id": 0})
-    return updated
+    # The caller immediately refreshes /signatures. Return only the signature
+    # fields needed for its local fallback, not the entire OS with photos.
+    return {
+        "os_number": os_number,
+        "signature_technician": final_tech,
+        "signature_client": final_client,
+        "signature_client_name": update_data.get("signature_client_name", order.get("signature_client_name")),
+        "signature_client_cpf": update_data.get("signature_client_cpf", order.get("signature_client_cpf")),
+        "signature_tech_name": update_data.get("signature_tech_name", order.get("signature_tech_name")),
+        "signature_date": now,
+    }
 
 @api_router.get("/service-orders/{os_number}/signatures")
 async def get_signatures(os_number: str, _: dict = Depends(verify_token)):
@@ -2332,32 +2340,33 @@ async def get_service_order(os_number: str, include_photos: bool = False, payloa
     """OS detail. By default photos are EXCLUDED to drastically reduce egress
     (each photo can be a multi-MB base64 string). Pass ?include_photos=1 when
     the UI actually needs to render them (edit modal / laudo modal)."""
+    # Inclusion projection: details are explicit; photos are added only for
+    # callers that explicitly request them. This avoids SELECT *.
+    detail_fields = {
+        "_id": 0,
+        "id": 1, "os_number": 1, "customer_name": 1, "registration_date": 1,
+        "attendance_date": 1, "status": 1, "sub_status": 1, "micro_status": 1,
+        "service_type": 1, "source": 1, "brand": 1, "model": 1, "product": 1,
+        "address": 1, "number": 1, "complement": 1, "neighborhood": 1,
+        "city": 1, "state": 1, "cep": 1, "reference_point": 1,
+        "phone1": 1, "phone2": 1, "landline": 1, "email": 1, "technician": 1,
+        "serial_number": 1, "batch": 1, "reported_defect": 1,
+        "technical_diagnosis": 1, "installation_correct": 1, "required_parts": 1,
+        "voltage_f1f2": 1, "voltage_f1_terra": 1, "voltage_f2_terra": 1,
+        "observations": 1, "priority": 1, "visit_fee": 1, "visit_fee_paid": 1,
+        "lat": 1, "lng": 1, "sort_date": 1,
+        "status_orcamento": 1, "conclusao_orcamento": 1,
+        "signature_customer": 1, "signature_technician": 1,
+        "signature_client": 1, "signature_client_name": 1,
+        "signature_client_cpf": 1, "signature_date": 1, "signature_tech_name": 1,
+        "assinafy_status": 1, "assinafy_document_id": 1,
+        "scheduling_history": 1, "print_count": 1, "share_token": 1,
+        "created_at": 1, "updated_at": 1, "site_info": 1,
+    }
     if include_photos:
-        order = await db.service_orders.find_one({"os_number": os_number}, {"_id": 0})
-    else:
-        # Inclusion projection — list every non-photo column.
-        detail_fields = {
-            "_id": 0,
-            "id": 1, "os_number": 1, "customer_name": 1, "registration_date": 1,
-            "attendance_date": 1, "status": 1, "sub_status": 1, "micro_status": 1,
-            "service_type": 1, "source": 1, "brand": 1, "model": 1, "product": 1,
-            "address": 1, "number": 1, "complement": 1, "neighborhood": 1,
-            "city": 1, "state": 1, "cep": 1, "reference_point": 1,
-            "phone1": 1, "phone2": 1, "landline": 1, "email": 1, "technician": 1,
-            "serial_number": 1, "batch": 1, "reported_defect": 1,
-            "technical_diagnosis": 1, "installation_correct": 1, "required_parts": 1,
-            "voltage_f1f2": 1, "voltage_f1_terra": 1, "voltage_f2_terra": 1,
-            "observations": 1, "priority": 1, "visit_fee": 1, "visit_fee_paid": 1,
-            "lat": 1, "lng": 1, "sort_date": 1,
-            "status_orcamento": 1, "conclusao_orcamento": 1,
-            "signature_customer": 1, "signature_technician": 1,
-            "signature_client": 1, "signature_client_name": 1,
-            "signature_client_cpf": 1, "signature_date": 1, "signature_tech_name": 1,
-            "assinafy_status": 1, "assinafy_document_id": 1,
-            "scheduling_history": 1, "print_count": 1, "share_token": 1,
-            "created_at": 1, "updated_at": 1,
-        }
-        order = await db.service_orders.find_one({"os_number": os_number}, detail_fields)
+        for i in range(1, 10):
+            detail_fields[f"photo_{i}"] = 1
+    order = await db.service_orders.find_one({"os_number": os_number}, detail_fields)
     if not order:
         raise HTTPException(status_code=404, detail="Ordem de Serviço não encontrada")
 
@@ -2383,20 +2392,41 @@ async def get_service_order(os_number: str, include_photos: bool = False, payloa
 
 
 @api_router.get("/service-orders/{os_number}/photos")
-async def get_service_order_photos(os_number: str, _: dict = Depends(verify_token)):
+async def get_service_order_photos(os_number: str, payload: dict = Depends(verify_token)):
     """Dedicated endpoint to lazy-load photos only when needed (e.g. when the
     photos tab/modal opens). Isolates heavy base64 payloads to reduce egress."""
-    proj = {"_id": 0, "os_number": 1}
+    proj = {"_id": 0, "os_number": 1, "source": 1}
     for i in range(1, 10):
         proj[f"photo_{i}"] = 1
     photos = await db.service_orders.find_one({"os_number": os_number}, proj)
     if not photos:
         raise HTTPException(status_code=404, detail="Ordem de Serviço não encontrada")
+    if payload.get("role") == "invisacook" and photos.get("source") != "invisacook":
+        raise HTTPException(status_code=403, detail="Acesso restrito a OSs Invisacook")
+    await _assert_tech_os(payload, os_number)
+    photos.pop("source", None)
     return photos
 
 @api_router.put("/service-orders/{os_number}")
 async def update_service_order(os_number: str, updates: ServiceOrderUpdate, request: Request, background_tasks: BackgroundTasks, payload: dict = Depends(verify_token)):
-    order = await db.service_orders.find_one({"os_number": os_number}, {"_id": 0})
+    # A rota só precisa destes campos para validar permissões, notificações
+    # e sincronização financeira. Não carregar fotos/Base64 para um PUT.
+    order_fields = {
+        "_id": 0,
+        "os_number": 1,
+        "source": 1,
+        "status": 1,
+        "technician": 1,
+        "visit_fee": 1,
+        "visit_fee_paid": 1,
+        "registration_date": 1,
+        "created_at": 1,
+        "customer_name": 1,
+    }
+    order = await db.service_orders.find_one(
+        {"os_number": os_number},
+        order_fields,
+    )
     if not order:
         raise HTTPException(status_code=404, detail="Ordem de Serviço não encontrada")
     await _assert_tech_os(payload, os_number)
@@ -2428,25 +2458,17 @@ async def update_service_order(os_number: str, updates: ServiceOrderUpdate, requ
     # `photo_i = ''` when their hydration hasn't finished (race), which used
     # to wipe photos already saved from another device. To EXPLICITLY clear
     # a photo, send `clear_photos: [1,3,...]` (indices 1..8) alongside the
-    # PUT body — see LaudoModal.handleImageChange for the intended UX.
+    # PUT body — see LaudoModal.handleImageChange for the intended UX (indices 1..9).
     clear_indices = set()
     raw_clear = raw_body.get("clear_photos")
     if isinstance(raw_clear, list):
         for idx in raw_clear:
             try: clear_indices.add(int(idx))
             except (TypeError, ValueError): pass
-    for i in range(1, 9):
+    for i in range(1, 10):
         key = f"photo_{i}"
         if key in update_data and update_data[key] == "" and i not in clear_indices:
-            existing = order.get(key)
-            if existing:
-                # Silently drop the destructive empty-write. Log for visibility.
-                logger.info(
-                    f"PHOTO GUARD: refusing to clear {key} on OS {os_number} "
-                    f"(client sent '' but a photo is stored). Send "
-                    f"clear_photos=[{i}] to force."
-                )
-                update_data.pop(key, None)
+            update_data.pop(key, None)
 
     # Check if any nullable field was explicitly sent as null/false in the raw request
     for field in nullable_fields:
@@ -2528,22 +2550,39 @@ async def update_service_order(os_number: str, updates: ServiceOrderUpdate, requ
         except Exception as e:
             logger.error(f"Error propagating OS {os_number} changes to routes: {e}")
     
-    updated_order = await db.service_orders.find_one({"os_number": os_number}, {"_id": 0})
-    # Merge priority from MongoDB
-    meta = await os_metadata_col.find_one({"os_number": os_number}, {"_id": 0, "priority": 1, "print_count": 1})
-    updated_order["priority"] = meta.get("priority", False) if meta else False
-    updated_order["print_count"] = meta.get("print_count", 0) if meta else 0
-    # Coerce string-typed null fields (Telecontrol-imported records may have NULLs)
-    for f in ["customer_name", "registration_date", "cep", "address", "number", "complement", "neighborhood", "city", "state", "phone1", "phone2", "landline", "email", "product", "brand", "model", "reported_defect", "service_type", "status", "technician", "reference_point", "observations"]:
-        if updated_order.get(f) is None:
-            updated_order[f] = ""
-    # Invalidate caches
+    # Invalidate cached list/summary responses after a successful write.
     cache.invalidate("os_list:")
     cache.invalidate("overdue")
     cache.invalidate("statuses")
-    if {"status", "visit_fee", "visit_fee_paid"} & set(update_data.keys()):
-        background_tasks.add_task(finance_module.on_os_updated, dict(updated_order))
-    return updated_order
+
+    # Finance only needs these fields. Build its input from the small
+    # pre-update projection plus the submitted changes; do not re-read the
+    # complete OS (which used to download every Base64 photo after each PUT).
+    if {"status", "visit_fee", "visit_fee_paid"} & set(update_data):
+        finance_source = {**order, **update_data, "os_number": os_number}
+        finance_fields = {
+            "os_number", "status", "visit_fee", "visit_fee_paid",
+            "registration_date", "created_at", "updated_at",
+            "technician", "customer_name",
+        }
+        finance_order = {
+            key: value for key, value in finance_source.items()
+            if key in finance_fields
+        }
+        background_tasks.add_task(finance_module.on_os_updated, finance_order)
+
+    # The frontend already has the submitted patch; return only a small ACK.
+    ack = {
+        "ok": True,
+        "os_number": os_number,
+        "updated_at": update_data["updated_at"],
+    }
+    for field in ("status", "visit_fee", "visit_fee_paid"):
+        if field in update_data:
+            ack[field] = update_data[field]
+    if "priority" in raw_body and raw_body["priority"] is not None:
+        ack["priority"] = bool(raw_body["priority"])
+    return ack
 
 @api_router.delete("/service-orders/{os_number}")
 async def delete_service_order(os_number: str, _: dict = Depends(verify_token)):
