@@ -7,6 +7,7 @@ import ServiceOrdersPage from './pages/ServiceOrdersPage';
 import InventoryPage from './pages/InventoryPage';
 import FinancialPage from './pages/FinancialPage';
 import RoutesPage from './pages/RoutesPage';
+import GeolocationReviewPage from './pages/GeolocationReviewPage';
 import ManuaisPage from './pages/ManuaisPage';
 import WhatsAppConfigPage from './pages/WhatsAppConfigPage';
 import UsersPage from './pages/UsersPage';
@@ -80,6 +81,14 @@ function AppRoutes() {
   const defaultDest = user ? firstPage(user) : '/login';
   return (
     <Routes>
+      <Route
+        path="/geolocation-review"
+        element={
+          <ProtectedRoute page="service-orders">
+            <GeolocationReviewPage />
+          </ProtectedRoute>
+        }
+      />
       <Route 
         path="/login" 
         element={

@@ -2411,6 +2411,7 @@ async def get_service_order_photos(os_number: str, payload: dict = Depends(verif
 async def update_service_order(os_number: str, updates: ServiceOrderUpdate, request: Request, background_tasks: BackgroundTasks, payload: dict = Depends(verify_token)):
     # A rota só precisa destes campos para validar permissões, notificações
     # e sincronização financeira. Não carregar fotos/Base64 para um PUT.
+    
     order_fields = {
         "_id": 0,
         "os_number": 1,
@@ -2422,6 +2423,15 @@ async def update_service_order(os_number: str, updates: ServiceOrderUpdate, requ
         "registration_date": 1,
         "created_at": 1,
         "customer_name": 1,
+
+        # Dados necessários para comparar o endereço anterior
+        # com o endereço recebido na atualização.
+        "address": 1,
+        "number": 1,
+        "neighborhood": 1,
+        "city": 1,
+        "state": 1,
+        "cep": 1,
     }
     order = await db.service_orders.find_one(
         {"os_number": os_number},
@@ -2515,10 +2525,36 @@ async def update_service_order(os_number: str, updates: ServiceOrderUpdate, requ
         background_tasks.add_task(send_webhook_status, os_number, new_status, tech, "", "status_update")
     
     await db.service_orders.update_one({"os_number": os_number}, {"$set": update_data})
-    
+    # Detecta mudança REAL na identidade do endereço.
+    # Não invalida apenas porque o frontend enviou novamente
+    # campos que permaneceram iguais.
+    address_identity_fields = {
+        "address",
+        "number",
+        "neighborhood",
+        "city",
+        "state",
+        "cep",
+    }
+
+    address_changed = any(
+        field in update_data
+        and order.get(field) != update_data.get(field)
+        for field in address_identity_fields
+    )
+
+    if address_changed:
+        from routes_module import invalidate_os_geolocation
+
+        await invalidate_os_geolocation(db, os_number)
+
+        logger.info(
+            "Geolocalização invalidada após alteração do endereço da OS %s",
+            os_number
+        )
+
     # Propagate changes to any routes containing this OS
-    address_fields = {"address", "number", "complement", "neighborhood", "city", "cep", "state", "lat", "lng"}
-    address_changed = bool(address_fields & set(update_data.keys()))
+    # address_changed já foi calculado comparando os valores antigos e novos.
     route_sync_fields = {"customer_name", "phone1", "phone2", "landline", "email",
                          "address", "number", "complement", "neighborhood", "city", "cep", "state",
                          "product", "brand", "model", "service_type", "status", "technician",

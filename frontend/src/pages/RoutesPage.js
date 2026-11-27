@@ -606,10 +606,9 @@ const RouteMapDialog = ({ open, onClose, orders, routeName, token, routeId, user
     currentNavTargetRef.current = null;
   };
 
-  const buildWaypoint = (order) => {
-    if (hasCoords(order)) return { lat: Number(order.lat), lng: Number(order.lng) };
-    return { address: normalizeAddressForMaps(order, true) };
-  };
+  const buildWaypoint = (order) => ({
+  os_number: String(order.os_number)
+  });
 
   const parseDuration = (durStr) => parseInt((durStr || '0').replace('s', ''), 10) || 0;
 
@@ -694,7 +693,7 @@ const RouteMapDialog = ({ open, onClose, orders, routeName, token, routeId, user
       const status = stopStatuses[o.os_number];
       return !status || status === 'pending' || status === 'arrived' || status === 'in_transit';
     });
-    if (!nextStop || !nextStop.lat || !nextStop.lng) {
+    if (!nextStop || !nextStop.os_number) {
       if (navPolylineRef.current) { navPolylineRef.current.setMap(null); navPolylineRef.current = null; }
       if (navPulseRef.current) { navPulseRef.current.setMap(null); navPulseRef.current = null; }
       navSegmentsRef.current.forEach(p => p.setMap(null));
@@ -727,10 +726,13 @@ const RouteMapDialog = ({ open, onClose, orders, routeName, token, routeId, user
 
     try {
       const res = await axios.post(`${API}/routes/nav-leg`, {
-        origin_lat: techLat, origin_lng: techLng,
-        dest_lat: nextStop.lat, dest_lng: nextStop.lng,
-        origin_heading: movingHeading,
-      }, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+        origin_lat: techLat,
+        origin_lng: techLng,
+        dest_os_number: String(nextStop.os_number),
+        origin_heading: movingHeading
+      }, token ? {
+        headers: { Authorization: `Bearer ${token}` }
+      } : {});
       if (seq !== navReqSeqRef.current) return;
 
       const data = res.data || {};
@@ -2626,13 +2628,53 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
         setLoadingProximity(false);
         return;
       }
-      const cacheRes = await axios.post(`${API}/routes/geocode`, { os_numbers: osNumbers }, getAuthHeader());
-      const results = cacheRes.data.results || [];
-      const coordMap = {};
-      results.forEach(r => { if (r.cached) coordMap[r.os_number] = { lat: r.lat, lng: r.lng }; });
-      const withCoords = routableOrders
-        .map(o => ({ ...o, lat: coordMap[o.os_number]?.lat || o.lat, lng: coordMap[o.os_number]?.lng || o.lng }))
-        .filter(o => hasCoords(o));
+      
+const cacheRes = await axios.post(
+  `${API}/routes/geocode`,
+  { os_numbers: osNumbers },
+  getAuthHeader()
+);
+
+const results = cacheRes.data.results || [];
+
+// Somente o backend pode declarar uma coordenada aprovada.
+const coordMap = {};
+
+results.forEach((r) => {
+  if (
+    r.status === 'approved' &&
+    r.cached === true &&
+    Number.isFinite(Number(r.lat)) &&
+    Number.isFinite(Number(r.lng))
+  ) {
+    coordMap[String(r.os_number)] = {
+      lat: Number(r.lat),
+      lng: Number(r.lng),
+      geo_status: 'approved'
+    };
+  }
+});
+
+    // NÃO usar o.lat/o.lng como fallback.
+    // Esses campos podem conter coordenadas antigas.
+    const withCoords = routableOrders
+      .filter(o => coordMap[String(o.os_number)])
+      .map(o => ({
+        ...o,
+        ...coordMap[String(o.os_number)]
+      }));
+
+    const withoutApprovedCoords = routableOrders.filter(
+      o => !coordMap[String(o.os_number)]
+    );
+
+    if (withoutApprovedCoords.length > 0) {
+      toast.warning(
+        `${withoutApprovedCoords.length} OS sem localização aprovada foram retiradas das sugestões. Revise os endereços.`,
+        { duration: 8000 }
+      );
+    }
+
       if (withCoords.length < 2) {
         toast.error('Poucas OS com coordenadas. Otimize uma rota primeiro para geocodificar os endereços.');
         setLoadingProximity(false);
@@ -2779,8 +2821,21 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
       // Rota calculada de verdade: sai da base, ordem otimizada das OSs e volta à base.
       try {
         const r = await axios.post(`${API}/routes/compute-route`, {
-          origin: { lat: BASE_LAT, lng: BASE_LNG }, destination: { lat: BASE_LAT, lng: BASE_LNG },
-          intermediates: p.orders.map(o => ({ lat: o.lat, lng: o.lng })), optimize_waypoint_order: true, round_trip: true,
+          origin: {
+            lat: BASE_LAT,
+            lng: BASE_LNG,
+            kind: 'base'
+          },
+          destination: {
+            lat: BASE_LAT,
+            lng: BASE_LNG,
+            kind: 'base'
+          },
+          intermediates: p.orders.map(o => ({
+            os_number: String(o.os_number)
+          })),
+          optimize_waypoint_order: true,
+          round_trip: true,
         }, getAuthHeader());
         const route = r.data.routes?.[0];
         const legs = route?.legs || [];
@@ -2835,33 +2890,50 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
     setStep(3);
     let cachedMap = {};
 
-    try {
-      // Check cached coords from backend
-      setGeocodeProgress('Verificando coordenadas...');
-      const osNumbers = selected.map(o => o.os_number);
-      try {
-        const cacheRes = await axios.post(`${API}/routes/geocode`, { os_numbers: osNumbers }, getAuthHeader());
-        (cacheRes.data.results || []).forEach(r => { if (r.cached) cachedMap[r.os_number] = r; });
-        const bad = (cacheRes.data.results || []).filter(r => !r.cached);
-        if (bad.length) toast.warning(`Endereço impreciso/não encontrado: ${bad.map(r => `OS ${r.os_number}${r.precision === 'approximate' ? ' (só rua/bairro)' : ''}`).join(', ')} — confira o endereço.`, { duration: 8000 });
-      } catch (e) { console.warn('Cache check failed:', e); }
+          try {
+        const osNumbers = selected.map(o => String(o.os_number));
 
-      // Build waypoints for Routes API
-      setGeocodeProgress('Calculando rota otimizada...');
-      const waypointData = selected.map(order => {
-        const cached = cachedMap[order.os_number];
-        if (cached) {
-          return { order, waypoint: { lat: cached.lat, lng: cached.lng }, hasCachedCoords: true };
+        // Consulta de coordenadas em cache
+        try {
+          const cacheRes = await axios.post(
+            `${API}/routes/geocode`,
+            { os_numbers: osNumbers },
+            getAuthHeader()
+          );
+
+          (cacheRes.data.results || []).forEach(r => {
+            if (r.status === 'approved' && r.cached === true) {
+              cachedMap[String(r.os_number)] = r;
+            }
+          });
+        } catch (e) {
+          console.warn('Cache check failed:', e);
         }
-        return { order, waypoint: { address: cleanAddress(order) }, hasCachedCoords: false };
-      });
+      // Build waypoints for Routes API
+      setGeocodeProgress('Calculando rota otimizada...');      
+      const waypointData = selected.map(order => ({
+        order,
+        waypoint: {
+          os_number: String(order.os_number)
+        },
+        hasCachedCoords: Boolean(cachedMap[String(order.os_number)])
+      }));
+
 
       const BASE_WP = { lat: BASE_LAT, lng: BASE_LNG };
 
-      // Call backend Routes API proxy
+      // Chamada backend Routes API proxy
       const routeRes = await axios.post(`${API}/routes/compute-route`, {
-        origin: BASE_WP,
-        destination: BASE_WP,
+        origin: {
+          lat: BASE_LAT,
+          lng: BASE_LNG,
+          kind: 'base'
+        },
+        destination: {
+          lat: BASE_LAT,
+          lng: BASE_LNG,
+          kind: 'base'
+        },
         intermediates: waypointData.map(w => w.waypoint),
         optimize_waypoint_order: true,
         round_trip: true,
@@ -2880,8 +2952,14 @@ const CreateRouteModal = ({ open, onClose, onCreated, token, technicianNames = [
         const leg = legs[seq];
         const endLoc = leg?.endLocation?.latLng;
         // Sem coordenada validada: não grava o ponto que a API de rotas adivinhou pelo endereço.
-        const lat = wp.hasCachedCoords ? (endLoc?.latitude ?? wp.order.lat) : null;
-        const lng = wp.hasCachedCoords ? (endLoc?.longitude ?? wp.order.lng) : null;
+        const approved = Boolean(cachedMap[String(wp.order.os_number)]);
+        const lat = approved
+          ? Number(cachedMap[String(wp.order.os_number)].lat)
+          : null;
+
+        const lng = approved
+          ? Number(cachedMap[String(wp.order.os_number)].lng)
+          : null;
 
         return { ...wp.order, lat, lng, sequence: seq + 1 };
       });
@@ -4189,23 +4267,26 @@ const EditRouteModal = ({ open, onClose, route, token, onUpdated, technicianName
         (cacheRes.data.results || []).forEach(r => { if (r.cached) cachedMap[r.os_number] = r; });
       } catch (e) { console.warn('Cache check failed:', e); }
 
-      const getWaypoint = (order) => {
-        const cached = cachedMap[order.os_number];
-        if (cached) return { lat: cached.lat, lng: cached.lng };
-        if (hasCoords(order)) return { lat: order.lat, lng: order.lng };
-        return { address: cleanAddr(order) };
-      };
+      const getWaypoint = (order) => ({
+        os_number: String(order.os_number)
+      });
+
 
       // Use OS #1 as origin, remaining as optimized intermediates
       const firstWp = getWaypoint(firstOrder);
       const remainingWps = remainingOrders.map(o => ({ order: o, waypoint: getWaypoint(o) }));
 
       const routeRes = await axios.post(`${API}/routes/compute-route`, {
-        origin: firstWp.address ? { address: firstWp.address } : { lat: firstWp.lat, lng: firstWp.lng },
-        destination: { lat: BASE_LAT, lng: BASE_LNG },
+        origin: firstWp,
+        destination: {
+          lat: BASE_LAT,
+          lng: BASE_LNG,
+          kind: 'base'
+        },
         intermediates: remainingWps.map(w => w.waypoint),
         optimize_waypoint_order: true,
       }, getAuthHeader());
+
 
       const routeResult = routeRes.data.routes?.[0];
       if (!routeResult) throw new Error('Nenhuma rota retornada');
@@ -4218,8 +4299,14 @@ const EditRouteModal = ({ open, onClose, route, token, onUpdated, technicianName
       // First order is always sequence 1
       const firstLeg = legs[0];
       const firstEndLoc = firstLeg?.startLocation?.latLng;
-      const firstLat = firstOrder.lat || firstEndLoc?.latitude || null;
-      const firstLng = firstOrder.lng || firstEndLoc?.longitude || null;
+      const firstApproved = cachedMap[String(firstOrder.os_number)];
+      const firstLat = firstApproved
+        ? Number(firstApproved.lat)
+        : null;
+
+      const firstLng = firstApproved
+        ? Number(firstApproved.lng)
+        : null;
       const reorderedFirst = { ...firstOrder, lat: firstLat, lng: firstLng, sequence: 1 };
 
       // Remaining orders reordered by optimization
@@ -4227,9 +4314,10 @@ const EditRouteModal = ({ open, onClose, route, token, onUpdated, technicianName
         const wp = remainingWps[originalIdx];
         const leg = legs[seq];
         const endLoc = leg?.endLocation?.latLng;
-        const validated = !!cachedMap[wp.order.os_number] || hasCoords(wp.order);
-        const lat = validated ? (endLoc?.latitude ?? wp.order.lat) : null;
-        const lng = validated ? (endLoc?.longitude ?? wp.order.lng) : null;
+        const approved = cachedMap[String(wp.order.os_number)];
+
+        const lat = approved ? Number(approved.lat) : null;
+        const lng = approved ? Number(approved.lng) : null;
         return { ...wp.order, lat, lng, sequence: seq + 2 };
       });
 

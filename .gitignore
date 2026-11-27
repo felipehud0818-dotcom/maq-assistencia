@@ -94,3 +94,5 @@ credentials.json
 *.key
 .credentials
 .venv/lib/python3.11/site-packages/playwright/driver/node
+frontend/node_modules/.cache/default-development/26.pack
+frontend/node_modules/.cache/default-development/22.pack

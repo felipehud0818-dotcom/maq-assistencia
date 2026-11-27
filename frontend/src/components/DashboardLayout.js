@@ -22,7 +22,8 @@ import {
   Webhook,
   Tag,
   AlertTriangle,
-  Sparkles
+  Sparkles,
+  MapPin
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import {
@@ -53,6 +54,12 @@ const menuItems = [
     path: '/routes', 
     label: 'Roteiros', 
     icon: Route 
+  },
+  {
+    path: '/geolocation-review',
+    label: 'Revisão de Endereços',
+    icon: MapPin,
+    adminOnly: true,
   },
   { 
     path: '/inventory', 

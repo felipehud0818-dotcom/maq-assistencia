@@ -149,12 +149,25 @@ def _norm(s) -> str:
 def _digits(s) -> str:
     return re.sub(r"\D", "", str(s or ""))
 
-
 def _num(s) -> str:
-    """Primeiro bloco numérico do número do imóvel ('150A' -> '150')."""
-    m = re.search(r"\d+", str(s or ""))
-    return m.group().lstrip("0") or ("0" if m else "") if m else ""
+    """
+    Normaliza o número do imóvel preservando letras de identificação.
+    Exemplos:
+      00150  -> 150
+      150A   -> 150a
+      150-B  -> 150b
+      150 A  -> 150a
+    """
+    raw = _norm(s).replace(" ", "")
 
+    match = re.fullmatch(r"0*(\d+)[-]?([a-z]?)", raw)
+
+    if match:
+        numeric = match.group(1).lstrip("0") or "0"
+        suffix = match.group(2)
+        return numeric + suffix
+
+    return raw
 
 def _norm_uf(state) -> str:
     n = _norm(state)
@@ -329,21 +342,50 @@ async def invalidate_os_geolocation(db, os_number: str):
         await _invalidate_os_geolocation(db, so["os_number"], _address_hash(_address_parts(so)))
 
 
-async def _sync_orders_coords(db, orders: list, with_complement: bool = False) -> list:
-    """Substitui lat/lng das OSs do roteiro pela coordenada validada da OS (ou None)."""
-    nums = [str(o.get("os_number")) for o in orders if o.get("os_number")]
+
+async def _sync_routes_coords(db, routes: list) -> list:
+    """
+    Sincroniza as coordenadas de todas as OSs de vários roteiros
+    em uma única consulta ao banco.
+    """
+    nums = list({
+        str(o.get("os_number"))
+        for route in routes
+        for o in (route.get("orders") or [])
+        if o.get("os_number")
+    })
+
     if not nums:
-        return orders
-    sos = await db.service_orders.find({"os_number": {"$in": nums}}, _OS_GEO_PROJECTION).to_list(len(nums))
-    by_num = {str(s.get("os_number")): s for s in sos}
-    for o in orders:
-        so = by_num.get(str(o.get("os_number")))
-        coords = _validated_coords(so) if so else None
-        o["lat"], o["lng"] = coords if coords else (None, None)
-        o["geo_status"] = "approved" if coords else ((so or {}).get("geolocation") or {}).get("status", "pending")
-        if with_complement and so is not None:
-            o["complement"] = so.get("complement") or ""
-    return orders
+        return routes
+
+    sos = await db.service_orders.find(
+        {"os_number": {"$in": nums}},
+        _OS_GEO_PROJECTION
+    ).to_list(len(nums))
+
+    by_num = {
+        str(so.get("os_number")): so
+        for so in sos
+    }
+
+    for route in routes:
+        for order in route.get("orders") or []:
+            so = by_num.get(str(order.get("os_number")))
+            coords = _validated_coords(so) if so else None
+
+            order["lat"], order["lng"] = (
+                coords if coords else (None, None)
+            )
+
+            order["geo_status"] = (
+                "approved"
+                if coords
+                else ((so or {}).get("geolocation") or {}).get(
+                    "status", "pending"
+                )
+            )
+
+    return routes
 
 
 # ─── Cache de geocode ──────────────────────────────────────────────────
@@ -422,13 +464,25 @@ async def _own_route(db, route_id: str, payload: dict) -> dict:
         raise HTTPException(status_code=403, detail="Acesso restrito a roteiros do próprio técnico")
     return route
 
-
 @router.get("/")
 async def list_routes(payload: dict = Depends(verify_token)):
     db = get_db()
-    routes = await db.routes.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
-    # Técnico: filtra em Python com a mesma regra de dono (sem regex — nome com caractere especial quebrava).
-    return [r for r in routes if _is_own(r.get("technician"), payload)]
+
+    routes = await db.routes.find(
+        {},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(5000)
+
+    # Mantém a restrição de acesso dos técnicos.
+    routes = [
+        r for r in routes
+        if _is_own(r.get("technician"), payload)
+    ]
+
+    # Nunca devolver coordenadas antigas armazenadas no documento do roteiro.
+    routes = await _sync_routes_coords(db, routes)
+
+    return routes
 
 
 @router.get("/{route_id}")
@@ -629,20 +683,42 @@ def _evaluate(parts: dict, res: dict) -> dict:
         elif ratio < 0.85:
             review.append("logradouro_parcial")
 
+    
     # CEP / bairro
     cep_ok = False
-    if parts["cep"] and got["cep"]:
-        if parts["cep"][:5] == got["cep"][:5]:
+
+    requested_cep = _digits(parts.get("cep"))
+    returned_cep = _digits(got.get("cep"))
+
+    if requested_cep:
+        if not returned_cep:
+            review.append("cep_nao_retornado")
+        elif requested_cep == returned_cep:
             cep_ok = True
         else:
             review.append("cep_divergente")
-    neigh_known = bool(parts["neighborhood"] and got["neighborhood"])
-    neigh_ok = neigh_known and _similar(parts["neighborhood"], got["neighborhood"])
-    if not cep_ok and "cep_divergente" not in review:
+
+    neigh_known = bool(
+        parts["neighborhood"] and got["neighborhood"]
+    )
+
+    neigh_ok = (
+        neigh_known
+        and _similar(
+            parts["neighborhood"],
+            got["neighborhood"]
+        )
+    )
+
+    if not cep_ok:
         if neigh_known and not neigh_ok:
             review.append("bairro_divergente")
-        elif not neigh_ok:
+        elif not neigh_ok and "cep_nao_retornado" not in review:
             review.append("sem_confirmacao_cep_ou_bairro")
+
+    if neigh_known and not neigh_ok and "bairro_divergente" not in review:
+        review.append("bairro_divergente")
+
 
     if res.get("partial_match"):
         review.append("correspondencia_parcial")
@@ -864,18 +940,115 @@ async def cache_coords(req: CacheCoordsRequest, payload: dict = Depends(verify_t
         parts = _address_parts(o)
         addr_hash = _address_hash(parts)
 
-        if item.source == "manual_confirmed":
-            if not parts["city"] or not parts["state"]:
-                rejected.append({"os_number": item.os_number, "reason": "faltando_cidade_ou_uf"})
-                continue
-            res = {"status": "approved", "lat": item.lat, "lng": item.lng, "precision": "MANUAL",
-                   "formatted_address": None, "place_id": None, "address_hash": addr_hash,
-                   "reasons": [], "source": "manual_confirmed"}
-            await _persist_geolocation(db, item.os_number, res, "manual_confirmed", user_id)
-            await _store_geocode_cache(db, parts, res, "manual_confirmed")
-            await _audit(db, o, parts, res, "manual_confirmed")
-            updated += 1
+        
+    if item.source == "manual_confirmed":
+        # Confirmação manual só pode ser feita por administrador.
+        if (payload or {}).get("role") not in {"admin", "master_admin"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Somente administradores podem confirmar localização manualmente."
+            )
+
+        if not parts["city"] or not parts["state"]:
+            rejected.append({
+                "os_number": item.os_number,
+                "reason": "faltando_cidade_ou_uf"
+            })
             continue
+
+        if not parts["street"] or not parts["number"]:
+            rejected.append({
+                "os_number": item.os_number,
+                "reason": "faltando_logradouro_ou_numero"
+            })
+            continue
+
+        # Confere se o ponto está em uma região geograficamente
+        # coerente com a cidade retornada pelo geocodificador reverso.
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="GOOGLE_MAPS_API_KEY não configurada."
+            )
+
+        try:
+            response = await _http().get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params={
+                    "latlng": f"{item.lat},{item.lng}",
+                    "key": api_key,
+                    "language": "pt-BR"
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            reverse_data = response.json()
+
+        except Exception as e:
+            logger.error(f"Reverse geocode manual falhou: {e!r}")
+            raise HTTPException(
+                status_code=502,
+                detail="Não foi possível validar o ponto no mapa."
+            )
+
+        reverse_results = reverse_data.get("results") or []
+        if not reverse_results:
+            rejected.append({
+                "os_number": item.os_number,
+                "reason": "ponto_sem_endereco_reverso"
+            })
+            continue
+
+        reverse = reverse_results[0]
+        reverse_comps = reverse.get("address_components") or []
+
+        reverse_city = _norm(next(
+            (
+                c.get("long_name", "")
+                for c in reverse_comps
+                if {"administrative_area_level_2", "locality"} & set(c.get("types", []))
+            ),
+            ""
+        ))
+
+        reverse_state = next(
+            (
+                c.get("short_name", "").upper()
+                for c in reverse_comps
+                if "administrative_area_level_1" in c.get("types", [])
+            ),
+            ""
+        )
+
+        if reverse_city != _norm(parts["city"]) or reverse_state != parts["state"]:
+            rejected.append({
+                "os_number": item.os_number,
+                "reason": "ponto_fora_da_cidade_ou_uf_informada",
+                "returned_city": reverse_city,
+                "returned_state": reverse_state
+            })
+            continue
+
+        res = {
+            "status": "approved",
+            "lat": item.lat,
+            "lng": item.lng,
+            "precision": "MANUAL",
+            "formatted_address": reverse.get("formatted_address"),
+            "place_id": reverse.get("place_id"),
+            "address_hash": addr_hash,
+            "reasons": [],
+            "source": "manual_confirmed"
+        }
+
+        await _persist_geolocation(
+            db, item.os_number, res, "manual_confirmed", user_id
+        )
+        await _store_geocode_cache(db, parts, res, "manual_confirmed")
+        await _audit(db, o, parts, res, "manual_confirmed")
+        updated += 1
+        continue
 
         res = await _geocode_os(db, o)
         if res["status"] != "approved":
@@ -892,6 +1065,11 @@ async def cache_coords(req: CacheCoordsRequest, payload: dict = Depends(verify_t
 
 @router.get("/geocode/pending")
 async def list_pending_geolocation(limit: int = 2000, payload: dict = Depends(verify_token)):
+    if (payload or {}).get("role") not in {"admin", "master_admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Apenas administradores podem consultar pendências de geolocalização."
+        )
     """OSs sem localização aprovada (pending/review/blocked/incomplete) para o filtro 'Precisa revisar'."""
     db = get_db()
     limit = max(1, min(limit, 5000))
